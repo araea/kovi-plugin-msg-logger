@@ -631,25 +631,37 @@ pub mod db {
                     break;
                 }
 
-                // 插入消息
-                if let Err(e) = messages::Entity::insert(write.message.clone())
-                    .exec(&txn)
-                    .await
-                {
-                    kovi::log::error!("[msg-logger] 消息写入失败: {}", e);
-                    success = false;
-                    break;
-                }
+                // 插入消息 - use insert() on ActiveModel to get the returned ID
+                let inserted = match write.message.clone().insert(&txn).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        kovi::log::error!("[msg-logger] 消息写入失败: {}", e);
+                        success = false;
+                        break;
+                    }
+                };
+                let db_id = inserted.id;
 
-                // 插入关键词
-                if !write.keywords.is_empty()
-                    && let Err(e) = keywords::Entity::insert_many(write.keywords.clone())
+                // 插入关键词 - update message_id with actual ID
+                if !write.keywords.is_empty() {
+                    let keywords_with_id: Vec<keywords::ActiveModel> = write
+                        .keywords
+                        .iter()
+                        .map(|kw| {
+                            let mut kw = kw.clone();
+                            kw.message_id = ActiveValue::Set(db_id);
+                            kw
+                        })
+                        .collect();
+
+                    if let Err(e) = keywords::Entity::insert_many(keywords_with_id)
                         .exec(&txn)
                         .await
-                {
-                    kovi::log::error!("[msg-logger] 关键词写入失败: {}", e);
-                    success = false;
-                    break;
+                    {
+                        kovi::log::error!("[msg-logger] 关键词写入失败: {}", e);
+                        success = false;
+                        break;
+                    }
                 }
             }
 
