@@ -732,7 +732,7 @@ pub mod db {
             let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
 
             let mut opt = sea_orm::ConnectOptions::new(db_url);
-            opt.sqlx_logging(true)
+            opt.sqlx_logging(false)
                 .max_connections(10)
                 .min_connections(2)
                 .connect_timeout(std::time::Duration::from_secs(10))
