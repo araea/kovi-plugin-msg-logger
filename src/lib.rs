@@ -531,6 +531,10 @@ pub mod db {
                 ..Default::default()
             };
 
+            // 1. 先确保用户存在
+            self.upsert_user(event, created_at).await?;
+
+            // 2. 再插入消息
             let inserted = msg_model.insert(&self.db).await?;
             let db_id = inserted.id;
 
