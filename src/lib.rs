@@ -756,7 +756,6 @@ pub mod db {
                 "CREATE INDEX IF NOT EXISTS idx_keywords_group_id ON keywords(group_id)",
                 "CREATE INDEX IF NOT EXISTS idx_keywords_group_time ON keywords(group_id, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_keywords_user_id ON keywords(user_id)",
-                // 优化索引
                 "CREATE INDEX IF NOT EXISTS idx_messages_group_user_count ON messages(group_id, user_id)",
                 "CREATE INDEX IF NOT EXISTS idx_messages_user_group ON messages(user_id, group_id)",
                 "CREATE INDEX IF NOT EXISTS idx_keywords_user_group_time ON keywords(user_id, group_id, created_at)",
@@ -770,7 +769,6 @@ pub mod db {
                     .await;
             }
 
-            // SQLite 优化 PRAGMA（单独执行）
             let pragmas = [
                 "PRAGMA journal_mode=WAL",
                 "PRAGMA synchronous=NORMAL",
@@ -1670,7 +1668,7 @@ pub mod db {
                 .await?
                 .and_then(|r| r.try_get("", "hour_of_day").ok());
 
-            // 优化的排名计算
+            // 排名计算
             let rank_in_group = if let Some(gid) = group_id {
                 self.calculate_user_rank(gid, user_id, total_messages).await
             } else {
@@ -1691,7 +1689,7 @@ pub mod db {
             })
         }
 
-        /// 优化的用户排名计算
+        /// 用户排名计算
         async fn calculate_user_rank(
             &self,
             group_id: i64,
@@ -1933,7 +1931,7 @@ async fn main() {
     let logger = Arc::new(db::Logger::new(data_dir).await);
     LOGGER.set(logger.clone()).ok();
 
-    kovi::log::info!("[msg-logger] 消息记录器已启动（优化版）");
+    kovi::log::info!("[msg-logger] 消息记录器已启动");
 
     PluginBuilder::on_msg(move |event| {
         let logger = logger.clone();
