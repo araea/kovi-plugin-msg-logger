@@ -311,11 +311,22 @@ blacklist = []
             self.record_private
         }
 
-        /// 检查用户是否是管理员（配置文件中的管理员或群管理员/群主）
-        pub fn is_admin(&self, user_id: i64, sender_role: Option<&str>) -> bool {
+        /// 检查用户是否是管理员（配置文件中的管理员 OR 全局Bot管理员 OR 群管理员/群主）
+        pub fn is_admin(
+            &self,
+            user_id: i64,
+            sender_role: Option<&str>,
+            bot_admins: &[i64],
+        ) -> bool {
+            // 1. 检查插件配置文件的 admins
             if self.admins.contains(&user_id) {
                 return true;
             }
+            // 2. 检查 Kovi Bot 本体的全局管理员
+            if bot_admins.contains(&user_id) {
+                return true;
+            }
+            // 3. 检查群内权限
             matches!(sender_role, Some("admin") | Some("owner"))
         }
 
@@ -1324,6 +1335,9 @@ pub async fn get_logger() -> Option<Arc<db::Logger>> {
 #[kovi::plugin]
 async fn main() {
     let bot = PluginBuilder::get_runtime_bot();
+    // 克隆 bot 实例以便传入闭包
+    let bot_clone = bot.clone();
+
     let data_dir = bot.get_data_path();
 
     let config_lock = config::Config::load(data_dir.clone());
@@ -1337,6 +1351,7 @@ async fn main() {
     PluginBuilder::on_msg(move |event| {
         let logger = logger.clone();
         let config_lock = config_lock.clone();
+        let bot = bot_clone.clone();
 
         async move {
             // 判断是否需要记录
@@ -1373,9 +1388,12 @@ async fn main() {
 
             match text {
                 "开启记录" => {
+                    let bot_admins = bot.get_all_admin().unwrap_or_default();
+
                     let is_admin = {
                         let cfg = config_lock.read();
-                        cfg.is_admin(event.user_id, sender_role)
+                        // 传入 bot_admins
+                        cfg.is_admin(event.user_id, sender_role, &bot_admins)
                     };
                     if !is_admin {
                         event.reply("⚠️ 仅管理员可操作");
@@ -1388,9 +1406,13 @@ async fn main() {
                     event.reply(msg);
                 }
                 "关闭记录" => {
+                    // 获取全局管理员列表
+                    let bot_admins = bot.get_all_admin().unwrap_or_default();
+
                     let is_admin = {
                         let cfg = config_lock.read();
-                        cfg.is_admin(event.user_id, sender_role)
+                        // 传入 bot_admins
+                        cfg.is_admin(event.user_id, sender_role, &bot_admins)
                     };
                     if !is_admin {
                         event.reply("⚠️ 仅管理员可操作");
