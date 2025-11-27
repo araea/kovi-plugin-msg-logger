@@ -271,6 +271,64 @@ blacklist = []
         stop_words_set: HashSet<String>,
     }
 
+    /// 配置快照，用于避免长时间持有锁
+    #[derive(Clone)]
+    pub struct ConfigSnapshot {
+        pub mode: RecordMode,
+        pub record_private: bool,
+        pub admins: Vec<i64>,
+        pub whitelist: Vec<i64>,
+        pub blacklist: Vec<i64>,
+        pub tokenizer_enabled: bool,
+        pub min_word_length: usize,
+        pub stop_words: HashSet<String>,
+    }
+
+    impl ConfigSnapshot {
+        pub fn from_config(cfg: &Config) -> Self {
+            Self {
+                mode: cfg.mode.clone(),
+                record_private: cfg.record_private,
+                admins: cfg.admins.clone(),
+                whitelist: cfg.groups.whitelist.clone(),
+                blacklist: cfg.groups.blacklist.clone(),
+                tokenizer_enabled: cfg.tokenizer.enabled,
+                min_word_length: cfg.tokenizer.min_word_length,
+                stop_words: cfg.stop_words_set.clone(),
+            }
+        }
+
+        pub fn should_record_group(&self, group_id: i64) -> bool {
+            match self.mode {
+                RecordMode::Whitelist => self.whitelist.contains(&group_id),
+                RecordMode::Blacklist => !self.blacklist.contains(&group_id),
+            }
+        }
+
+        pub fn should_record_private(&self) -> bool {
+            self.record_private
+        }
+
+        pub fn is_admin(
+            &self,
+            user_id: i64,
+            sender_role: Option<&str>,
+            bot_admins: &[i64],
+        ) -> bool {
+            if self.admins.contains(&user_id) {
+                return true;
+            }
+            if bot_admins.contains(&user_id) {
+                return true;
+            }
+            matches!(sender_role, Some("admin") | Some("owner"))
+        }
+
+        pub fn is_stop_word(&self, word: &str) -> bool {
+            self.stop_words.contains(word)
+        }
+    }
+
     impl Config {
         pub fn load(data_dir: PathBuf) -> Arc<RwLock<Self>> {
             if !data_dir.exists() {
@@ -311,6 +369,11 @@ blacklist = []
             self.record_private
         }
 
+        /// 快速获取快照，最小化锁持有时间
+        pub fn snapshot(&self) -> ConfigSnapshot {
+            ConfigSnapshot::from_config(self)
+        }
+
         /// 检查用户是否是管理员（配置文件中的管理员 OR 全局Bot管理员 OR 群管理员/群主）
         pub fn is_admin(
             &self,
@@ -318,15 +381,12 @@ blacklist = []
             sender_role: Option<&str>,
             bot_admins: &[i64],
         ) -> bool {
-            // 1. 检查插件配置文件的 admins
             if self.admins.contains(&user_id) {
                 return true;
             }
-            // 2. 检查 Kovi Bot 本体的全局管理员
             if bot_admins.contains(&user_id) {
                 return true;
             }
-            // 3. 检查群内权限
             matches!(sender_role, Some("admin") | Some("owner"))
         }
 
@@ -382,46 +442,253 @@ blacklist = []
 
 /// 数据库管理与查询层
 pub mod db {
-    use super::config;
+    use super::config::{self};
     use super::entities::{prelude::*, *};
     use jieba_rs::Jieba;
     use kovi::MsgEvent;
     use kovi::chrono::{Datelike, NaiveDate, TimeZone, Timelike};
+    use parking_lot::Mutex;
+    use sea_orm::prelude::Expr;
+    use sea_orm::sea_query::OnConflict;
     use sea_orm::{
         ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
         DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema,
-        Statement,
+        Statement, TransactionTrait,
     };
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    use tokio::sync::mpsc;
 
-    /// 分词配置快照，避免长时间持有配置锁
-    #[derive(Clone)]
-    struct TokenizerSnapshot {
-        enabled: bool,
-        min_word_length: usize,
-        stop_words: std::collections::HashSet<String>,
+    // =============================
+    //       查询限制常量
+    // =============================
+
+    /// 查询限制常量
+    pub mod limits {
+        /// 词云最大返回数量
+        pub const MAX_WORD_CLOUD_LIMIT: u64 = 200;
+        /// 用户排行最大返回数量
+        pub const MAX_TOP_TALKERS_LIMIT: u64 = 100;
+        /// 搜索消息最大返回数量
+        pub const MAX_SEARCH_LIMIT: u64 = 500;
+        /// 用户消息历史最大返回数量
+        pub const MAX_USER_MESSAGES_LIMIT: u64 = 1000;
+        /// 最大查询天数
+        pub const MAX_QUERY_DAYS: i64 = 365;
+        /// 排名计算最大扫描用户数
+        pub const MAX_RANK_SCAN_USERS: i64 = 10000;
+        /// 默认查询超时（秒）
+        pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
+        /// 批量写入缓冲区大小
+        pub const WRITE_BUFFER_SIZE: usize = 1000;
+        /// 批量写入阈值
+        pub const WRITE_BATCH_THRESHOLD: usize = 50;
+        /// 批量写入间隔（毫秒）
+        pub const WRITE_FLUSH_INTERVAL_MS: u64 = 500;
     }
 
-    impl TokenizerSnapshot {
-        fn from_config(cfg: &config::Config) -> Self {
+    // =============================
+    //       查询缓存
+    // =============================
+
+    /// 简单的查询缓存
+    struct QueryCache<T> {
+        data: Option<(T, Instant)>,
+        ttl_secs: u64,
+    }
+
+    impl<T: Clone> QueryCache<T> {
+        fn new(ttl_secs: u64) -> Self {
             Self {
-                enabled: cfg.tokenizer.enabled,
-                min_word_length: cfg.tokenizer.min_word_length,
-                stop_words: cfg.tokenizer.stop_words.iter().cloned().collect(),
+                data: None,
+                ttl_secs,
             }
         }
 
-        fn is_stop_word(&self, word: &str) -> bool {
-            self.stop_words.contains(word)
+        fn get(&self) -> Option<T> {
+            self.data.as_ref().and_then(|(data, time)| {
+                if time.elapsed().as_secs() < self.ttl_secs {
+                    Some(data.clone())
+                } else {
+                    None
+                }
+            })
+        }
+
+        fn set(&mut self, value: T) {
+            self.data = Some((value, Instant::now()));
         }
     }
+
+    // =============================
+    //       批量写入
+    // =============================
+
+    /// 待写入的数据
+    struct PendingWrite {
+        message: messages::ActiveModel,
+        keywords: Vec<keywords::ActiveModel>,
+        user_upsert: users::ActiveModel,
+    }
+
+    /// 消息写入缓冲区
+    struct WriteBuffer {
+        tx: mpsc::Sender<PendingWrite>,
+        #[allow(dead_code)]
+        flush_flag: Arc<AtomicBool>,
+    }
+
+    impl WriteBuffer {
+        fn start(db: DatabaseConnection) -> Self {
+            let (tx, mut rx) = mpsc::channel::<PendingWrite>(limits::WRITE_BUFFER_SIZE);
+            let flush_flag = Arc::new(AtomicBool::new(false));
+            let flush_flag_clone = flush_flag.clone();
+
+            tokio::spawn(async move {
+                let mut buffer: Vec<PendingWrite> =
+                    Vec::with_capacity(limits::WRITE_BATCH_THRESHOLD * 2);
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
+                    limits::WRITE_FLUSH_INTERVAL_MS,
+                ));
+
+                loop {
+                    tokio::select! {
+                        recv_result = rx.recv() => {
+                            match recv_result {
+                                Some(write) => {
+                                    buffer.push(write);
+                                    // 达到批量阈值立即写入
+                                    if buffer.len() >= limits::WRITE_BATCH_THRESHOLD {
+                                        Self::flush_buffer(&db, &mut buffer).await;
+                                    }
+                                }
+                                None => {
+                                    // 通道关闭，刷新剩余数据并退出
+                                    if !buffer.is_empty() {
+                                        Self::flush_buffer(&db, &mut buffer).await;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        _ = interval.tick() => {
+                            // 定时刷新
+                            if !buffer.is_empty() {
+                                Self::flush_buffer(&db, &mut buffer).await;
+                            }
+                        }
+                    }
+
+                    // 检查强制刷新标志
+                    if flush_flag_clone.load(Ordering::Relaxed) && !buffer.is_empty() {
+                        Self::flush_buffer(&db, &mut buffer).await;
+                        flush_flag_clone.store(false, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            WriteBuffer { tx, flush_flag }
+        }
+
+        async fn flush_buffer(db: &DatabaseConnection, buffer: &mut Vec<PendingWrite>) {
+            if buffer.is_empty() {
+                return;
+            }
+
+            // 使用事务批量写入
+            let txn = match db.begin().await {
+                Ok(t) => t,
+                Err(e) => {
+                    kovi::log::error!("[msg-logger] 事务开始失败: {}", e);
+                    // 不清空 buffer，下次重试
+                    return;
+                }
+            };
+
+            let mut success = true;
+
+            for write in buffer.iter() {
+                // 插入用户
+                if let Err(e) = users::Entity::insert(write.user_upsert.clone())
+                    .on_conflict(
+                        OnConflict::column(users::Column::UserId)
+                            .update_column(users::Column::Nickname)
+                            .update_column(users::Column::LastSeen)
+                            .value(
+                                users::Column::MessageCount,
+                                Expr::col(users::Column::MessageCount).add(1),
+                            )
+                            .to_owned(),
+                    )
+                    .exec(&txn)
+                    .await
+                {
+                    kovi::log::error!("[msg-logger] 用户写入失败: {}", e);
+                    success = false;
+                    break;
+                }
+
+                // 插入消息
+                if let Err(e) = messages::Entity::insert(write.message.clone())
+                    .exec(&txn)
+                    .await
+                {
+                    kovi::log::error!("[msg-logger] 消息写入失败: {}", e);
+                    success = false;
+                    break;
+                }
+
+                // 插入关键词
+                if !write.keywords.is_empty()
+                    && let Err(e) = keywords::Entity::insert_many(write.keywords.clone())
+                        .exec(&txn)
+                        .await
+                {
+                    kovi::log::error!("[msg-logger] 关键词写入失败: {}", e);
+                    success = false;
+                    break;
+                }
+            }
+
+            if success {
+                if let Err(e) = txn.commit().await {
+                    kovi::log::error!("[msg-logger] 事务提交失败: {}", e);
+                } else {
+                    buffer.clear();
+                }
+            } else {
+                // 回滚事务
+                if let Err(e) = txn.rollback().await {
+                    kovi::log::error!("[msg-logger] 事务回滚失败: {}", e);
+                }
+                // 保留 buffer 以便重试，但为防止无限重试，只保留部分
+                if buffer.len() > limits::WRITE_BATCH_THRESHOLD {
+                    buffer.drain(0..limits::WRITE_BATCH_THRESHOLD);
+                }
+            }
+        }
+
+        async fn send(
+            &self,
+            write: PendingWrite,
+        ) -> Result<(), mpsc::error::SendError<PendingWrite>> {
+            self.tx.send(write).await
+        }
+    }
+
+    // =============================
+    //       消息记录器
+    // =============================
 
     /// 消息记录器核心结构
     pub struct Logger {
         db: DatabaseConnection,
         jieba: Arc<Jieba>,
         query_api: QueryApi,
+        write_buffer: WriteBuffer,
     }
 
     impl Logger {
@@ -432,7 +699,17 @@ pub mod db {
             let db_path = data_dir.join("msg_history.sqlite");
             let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
 
-            let db = Database::connect(&db_url)
+            let mut opt = sea_orm::ConnectOptions::new(db_url);
+            opt.sqlx_logging(false)
+                // 连接池配置
+                .max_connections(10)
+                .min_connections(2)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .idle_timeout(std::time::Duration::from_secs(300))
+                .max_lifetime(std::time::Duration::from_secs(3600));
+
+            let db = Database::connect(opt)
                 .await
                 .expect("Failed to connect to SQLite");
 
@@ -442,12 +719,14 @@ pub mod db {
                 .await
                 .expect("Failed to initialize Jieba");
 
-            let query_api = QueryApi { db: db.clone() };
+            let query_api = QueryApi::new(db.clone());
+            let write_buffer = WriteBuffer::start(db.clone());
 
             Self {
                 db,
                 jieba: Arc::new(jieba),
                 query_api,
+                write_buffer,
             }
         }
 
@@ -466,6 +745,7 @@ pub mod db {
                 .await;
 
             let indexes = [
+                // 基础索引
                 "CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id)",
                 "CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)",
                 "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)",
@@ -476,14 +756,33 @@ pub mod db {
                 "CREATE INDEX IF NOT EXISTS idx_keywords_group_id ON keywords(group_id)",
                 "CREATE INDEX IF NOT EXISTS idx_keywords_group_time ON keywords(group_id, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_keywords_user_id ON keywords(user_id)",
-                "PRAGMA journal_mode=WAL",
-                "PRAGMA synchronous=NORMAL",
-                "PRAGMA cache_size=10000",
+                // 优化索引
+                "CREATE INDEX IF NOT EXISTS idx_messages_group_user_count ON messages(group_id, user_id)",
+                "CREATE INDEX IF NOT EXISTS idx_messages_user_group ON messages(user_id, group_id)",
+                "CREATE INDEX IF NOT EXISTS idx_keywords_user_group_time ON keywords(user_id, group_id, created_at)",
+                // 用户小时分布索引
+                "CREATE INDEX IF NOT EXISTS idx_messages_user_hour ON messages(user_id, hour_of_day)",
             ];
 
             for sql in indexes {
                 let _ = db
                     .execute(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await;
+            }
+
+            // SQLite 优化 PRAGMA（单独执行）
+            let pragmas = [
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA synchronous=NORMAL",
+                "PRAGMA cache_size=-64000", // 64MB 缓存
+                "PRAGMA temp_store=MEMORY",
+                "PRAGMA mmap_size=268435456", // 256MB 内存映射
+                "PRAGMA busy_timeout=5000",   // 5秒锁等待超时
+            ];
+
+            for pragma in pragmas {
+                let _ = db
+                    .execute(Statement::from_string(DbBackend::Sqlite, pragma))
                     .await;
             }
         }
@@ -501,8 +800,21 @@ pub mod db {
             let hour_of_day = datetime.hour() as i32;
             let day_of_week = datetime.weekday().num_days_from_sunday() as i32;
 
-            let msg_text = event.borrow_text().unwrap_or("").to_string();
-            let raw_json = event.original_json.to_string();
+            let mut msg_text = event.borrow_text().unwrap_or("").to_string();
+            let mut raw_json = event.original_json.to_string();
+
+            const MAX_TEXT_LEN: usize = 4000;
+            const MAX_JSON_LEN: usize = 10000;
+
+            if msg_text.len() > MAX_TEXT_LEN {
+                msg_text.truncate(MAX_TEXT_LEN);
+                msg_text.push_str("...(truncated)");
+            }
+
+            if raw_json.len() > MAX_JSON_LEN {
+                raw_json.truncate(MAX_JSON_LEN);
+                raw_json.push_str("...(truncated)");
+            }
 
             let has_image = raw_json.contains("\"type\":\"image\"");
             let has_at = raw_json.contains("\"type\":\"at\"");
@@ -531,39 +843,189 @@ pub mod db {
                 ..Default::default()
             };
 
-            // 1. 先确保用户存在
-            self.upsert_user(event, created_at).await?;
-
-            // 2. 再插入消息
-            let inserted = msg_model.insert(&self.db).await?;
-            let db_id = inserted.id;
-
-            self.upsert_user(event, created_at).await?;
-
-            let tokenizer_snapshot = {
-                let cfg = config::get();
-                let cfg_read = cfg.read();
-                TokenizerSnapshot::from_config(&cfg_read)
+            // 准备用户数据
+            let nickname = event.sender.nickname.clone().unwrap_or_default();
+            let user_model = users::ActiveModel {
+                user_id: ActiveValue::Set(event.user_id),
+                nickname: ActiveValue::Set(nickname),
+                first_seen: ActiveValue::Set(created_at),
+                last_seen: ActiveValue::Set(created_at),
+                message_count: ActiveValue::Set(1),
             };
 
-            if tokenizer_snapshot.enabled && !msg_text.trim().is_empty() {
+            // 获取配置快照（快速释放锁）
+            let snapshot = {
+                let cfg = config::get();
+                let cfg_read = cfg.read();
+                cfg_read.snapshot()
+            };
+
+            // 准备关键词数据
+            let keywords = if snapshot.tokenizer_enabled && !msg_text.trim().is_empty() {
                 let jieba = self.jieba.clone();
                 let group_id = event.group_id;
                 let user_id = event.user_id;
+                let min_len = snapshot.min_word_length;
 
                 let keywords_data = tokio::task::spawn_blocking(move || {
                     let words = jieba.cut(&msg_text, true);
-                    let min_len = tokenizer_snapshot.min_word_length;
+                    let max_word_len = 20;
 
-                    words
-                        .into_iter()
-                        .filter(|w| {
-                            let s = w.trim();
-                            let len = s.chars().count();
-                            len >= min_len && !tokenizer_snapshot.is_stop_word(s)
-                        })
-                        .map(|w| (w.to_string(), w.chars().count() as i32))
-                        .collect::<Vec<_>>()
+                    // 使用 HashMap 聚合相同词，去重
+                    let mut word_set: HashMap<String, i32> = HashMap::new();
+
+                    for w in words {
+                        let s = w.trim();
+                        let len = s.chars().count();
+                        if len >= min_len && len <= max_word_len && !snapshot.is_stop_word(s) {
+                            word_set.entry(s.to_string()).or_insert(len as i32);
+                        }
+                    }
+
+                    word_set.into_iter().collect::<Vec<_>>()
+                })
+                .await?;
+
+                keywords_data
+                    .into_iter()
+                    .map(|(word, word_length)| keywords::ActiveModel {
+                        message_id: ActiveValue::Set(0), // 将在批量写入时更新
+                        word: ActiveValue::Set(word),
+                        word_length: ActiveValue::Set(word_length),
+                        group_id: ActiveValue::Set(group_id),
+                        user_id: ActiveValue::Set(user_id),
+                        created_at: ActiveValue::Set(created_at),
+                        ..Default::default()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // 发送到写入缓冲区
+            let pending = PendingWrite {
+                message: msg_model,
+                keywords,
+                user_upsert: user_model,
+            };
+
+            if let Err(e) = self.write_buffer.send(pending).await {
+                // 如果缓冲区满，回退到直接写入
+                kovi::log::warn!("[msg-logger] 写入缓冲区满，直接写入: {}", e);
+                self.direct_write(event, created_at, hour_of_day, day_of_week)
+                    .await?;
+            }
+
+            Ok(())
+        }
+
+        /// 直接写入（回退方案）
+        async fn direct_write(
+            &self,
+            event: &Arc<MsgEvent>,
+            created_at: i64,
+            hour_of_day: i32,
+            day_of_week: i32,
+        ) -> anyhow::Result<()> {
+            let mut msg_text = event.borrow_text().unwrap_or("").to_string();
+            let mut raw_json = event.original_json.to_string();
+
+            const MAX_TEXT_LEN: usize = 4000;
+            const MAX_JSON_LEN: usize = 10000;
+
+            if msg_text.len() > MAX_TEXT_LEN {
+                msg_text.truncate(MAX_TEXT_LEN);
+                msg_text.push_str("...(truncated)");
+            }
+
+            if raw_json.len() > MAX_JSON_LEN {
+                raw_json.truncate(MAX_JSON_LEN);
+                raw_json.push_str("...(truncated)");
+            }
+
+            let has_image = raw_json.contains("\"type\":\"image\"");
+            let has_at = raw_json.contains("\"type\":\"at\"");
+            let is_reply = raw_json.contains("\"type\":\"reply\"");
+
+            let msg_model = messages::ActiveModel {
+                message_id: ActiveValue::Set(event.message_id as i64),
+                user_id: ActiveValue::Set(event.user_id),
+                group_id: ActiveValue::Set(event.group_id),
+                msg_type: ActiveValue::Set(event.message_type.clone()),
+                sub_type: ActiveValue::Set(Some(event.sub_type.clone())),
+                raw_json: ActiveValue::Set(raw_json),
+                clean_text: ActiveValue::Set(msg_text.clone()),
+                text_length: ActiveValue::Set(msg_text.chars().count() as i32),
+                has_image: ActiveValue::Set(has_image),
+                has_at: ActiveValue::Set(has_at),
+                is_reply: ActiveValue::Set(is_reply),
+                sender_nickname: ActiveValue::Set(
+                    event.sender.nickname.clone().unwrap_or_default(),
+                ),
+                sender_card: ActiveValue::Set(event.sender.card.clone()),
+                sender_role: ActiveValue::Set(event.sender.role.clone()),
+                created_at: ActiveValue::Set(created_at),
+                hour_of_day: ActiveValue::Set(hour_of_day),
+                day_of_week: ActiveValue::Set(day_of_week),
+                ..Default::default()
+            };
+
+            // Upsert 用户
+            let nickname = event.sender.nickname.clone().unwrap_or_default();
+            let user_model = users::ActiveModel {
+                user_id: ActiveValue::Set(event.user_id),
+                nickname: ActiveValue::Set(nickname),
+                first_seen: ActiveValue::Set(created_at),
+                last_seen: ActiveValue::Set(created_at),
+                message_count: ActiveValue::Set(1),
+            };
+
+            users::Entity::insert(user_model)
+                .on_conflict(
+                    OnConflict::column(users::Column::UserId)
+                        .update_column(users::Column::Nickname)
+                        .update_column(users::Column::LastSeen)
+                        .value(
+                            users::Column::MessageCount,
+                            Expr::col(users::Column::MessageCount).add(1),
+                        )
+                        .to_owned(),
+                )
+                .exec(&self.db)
+                .await?;
+
+            // 插入消息
+            let inserted = msg_model.insert(&self.db).await?;
+            let db_id = inserted.id;
+
+            // 获取配置快照
+            let snapshot = {
+                let cfg = config::get();
+                let cfg_read = cfg.read();
+                cfg_read.snapshot()
+            };
+
+            if snapshot.tokenizer_enabled && !msg_text.trim().is_empty() {
+                let jieba = self.jieba.clone();
+                let group_id = event.group_id;
+                let user_id = event.user_id;
+                let min_len = snapshot.min_word_length;
+
+                let keywords_data = tokio::task::spawn_blocking(move || {
+                    let words = jieba.cut(&msg_text, true);
+                    let max_word_len = 20;
+
+                    let mut word_set: HashMap<String, i32> = HashMap::new();
+
+                    for w in words {
+                        let s = w.trim();
+                        let len = s.chars().count();
+                        if len >= min_len && len <= max_word_len && !snapshot.is_stop_word(s) {
+                            word_set.entry(s.to_string()).or_insert(len as i32);
+                        }
+                    }
+
+                    word_set.into_iter().collect::<Vec<_>>()
                 })
                 .await?;
 
@@ -584,34 +1046,6 @@ pub mod db {
                     keywords::Entity::insert_many(keywords)
                         .exec(&self.db)
                         .await?;
-                }
-            }
-
-            Ok(())
-        }
-
-        async fn upsert_user(&self, event: &Arc<MsgEvent>, timestamp: i64) -> anyhow::Result<()> {
-            let nickname = event.sender.nickname.clone().unwrap_or_default();
-            let existing = Users::find_by_id(event.user_id).one(&self.db).await?;
-
-            match existing {
-                Some(user) => {
-                    let new_count = user.message_count + 1;
-                    let mut active: users::ActiveModel = user.into();
-                    active.nickname = ActiveValue::Set(nickname);
-                    active.last_seen = ActiveValue::Set(timestamp);
-                    active.message_count = ActiveValue::Set(new_count);
-                    active.update(&self.db).await?;
-                }
-                None => {
-                    let new_user = users::ActiveModel {
-                        user_id: ActiveValue::Set(event.user_id),
-                        nickname: ActiveValue::Set(nickname),
-                        first_seen: ActiveValue::Set(timestamp),
-                        last_seen: ActiveValue::Set(timestamp),
-                        message_count: ActiveValue::Set(1),
-                    };
-                    new_user.insert(&self.db).await?;
                 }
             }
 
@@ -664,10 +1098,10 @@ pub mod db {
     /// 消息类型分布
     #[derive(Debug, Clone, Default)]
     pub struct MessageTypeStats {
-        pub text_only: i64,  // 纯文字消息
-        pub with_image: i64, // 包含图片
-        pub with_at: i64,    // 包含 @
-        pub with_reply: i64, // 回复消息
+        pub text_only: i64,
+        pub with_image: i64,
+        pub with_at: i64,
+        pub with_reply: i64,
         pub total: i64,
     }
 
@@ -691,7 +1125,7 @@ pub mod db {
     pub struct PeriodComparison {
         pub current_count: i64,
         pub previous_count: i64,
-        pub change_rate: f64, // 变化百分比
+        pub change_rate: f64,
     }
 
     // =============================
@@ -701,9 +1135,17 @@ pub mod db {
     #[derive(Clone)]
     pub struct QueryApi {
         db: DatabaseConnection,
+        storage_stats_cache: Arc<Mutex<QueryCache<StorageStats>>>,
     }
 
     impl QueryApi {
+        fn new(db: DatabaseConnection) -> Self {
+            Self {
+                db,
+                storage_stats_cache: Arc::new(Mutex::new(QueryCache::new(60))), // 60秒缓存
+            }
+        }
+
         /// 计算时间戳范围 (start_date 00:00:00 到 end_date 23:59:59)
         fn date_range_to_timestamps(start: NaiveDate, end: NaiveDate) -> (i64, i64) {
             use kovi::chrono::{Local, NaiveTime};
@@ -728,6 +1170,21 @@ pub mod db {
             (start_ts, end_ts)
         }
 
+        /// 带超时的查询执行
+        async fn query_with_timeout<T, F, Fut>(&self, f: F) -> anyhow::Result<T>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = anyhow::Result<T>>,
+        {
+            let timeout = tokio::time::Duration::from_secs(limits::DEFAULT_QUERY_TIMEOUT_SECS);
+            tokio::time::timeout(timeout, f()).await.map_err(|_| {
+                anyhow::anyhow!(
+                    "Query timeout after {}s",
+                    limits::DEFAULT_QUERY_TIMEOUT_SECS
+                )
+            })?
+        }
+
         /// 获取词云数据（基于天数，从今天往前）
         pub async fn word_cloud(
             &self,
@@ -735,6 +1192,8 @@ pub mod db {
             limit: u64,
             days: i64,
         ) -> anyhow::Result<Vec<WordCount>> {
+            let limit = limit.min(limits::MAX_WORD_CLOUD_LIMIT);
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -744,19 +1203,22 @@ pub mod db {
                 group_id, start_time, limit
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(WordCount {
-                    word: row.try_get("", "word")?,
-                    count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(WordCount {
+                        word: row.try_get("", "word")?,
+                        count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取词云数据（基于日期范围）
@@ -767,6 +1229,7 @@ pub mod db {
             start_date: NaiveDate,
             end_date: NaiveDate,
         ) -> anyhow::Result<Vec<WordCount>> {
+            let limit = limit.min(limits::MAX_WORD_CLOUD_LIMIT);
             let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
 
             let sql = format!(
@@ -776,19 +1239,22 @@ pub mod db {
                 group_id, start_ts, end_ts, limit
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(WordCount {
-                    word: row.try_get("", "word")?,
-                    count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(WordCount {
+                        word: row.try_get("", "word")?,
+                        count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取用户专属词云
@@ -799,6 +1265,8 @@ pub mod db {
             limit: u64,
             days: i64,
         ) -> anyhow::Result<Vec<WordCount>> {
+            let limit = limit.min(limits::MAX_WORD_CLOUD_LIMIT);
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let group_filter = match group_id {
@@ -813,19 +1281,22 @@ pub mod db {
                 user_id, start_time, group_filter, limit
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(WordCount {
-                    word: row.try_get("", "word")?,
-                    count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(WordCount {
+                        word: row.try_get("", "word")?,
+                        count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取24小时活跃分布
@@ -834,6 +1305,7 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<Vec<HourlyStats>> {
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -843,19 +1315,22 @@ pub mod db {
                 group_id, start_time
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(HourlyStats {
-                    hour: row.try_get("", "hour")?,
-                    count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(HourlyStats {
+                        hour: row.try_get("", "hour")?,
+                        count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取二维热力图数据 (星期 × 小时)
@@ -864,6 +1339,7 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<[[i64; 24]; 7]> {
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -873,21 +1349,24 @@ pub mod db {
                 group_id, start_time
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut grid = [[0i64; 24]; 7];
-            for row in rows {
-                let dow: i32 = row.try_get("", "day_of_week")?;
-                let hour: i32 = row.try_get("", "hour_of_day")?;
-                let count: i64 = row.try_get("", "count")?;
-                if (0..7).contains(&dow) && (0..24).contains(&hour) {
-                    grid[dow as usize][hour as usize] = count;
+                let mut grid = [[0i64; 24]; 7];
+                for row in rows {
+                    let dow: i32 = row.try_get("", "day_of_week")?;
+                    let hour: i32 = row.try_get("", "hour_of_day")?;
+                    let count: i64 = row.try_get("", "count")?;
+                    if (0..7).contains(&dow) && (0..24).contains(&hour) {
+                        grid[dow as usize][hour as usize] = count;
+                    }
                 }
-            }
-            Ok(grid)
+                Ok(grid)
+            })
+            .await
         }
 
         /// 获取星期活跃分布
@@ -896,6 +1375,7 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<Vec<(i32, i64)>> {
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -905,18 +1385,21 @@ pub mod db {
                 group_id, start_time
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                let dow: i32 = row.try_get("", "day_of_week")?;
-                let count: i64 = row.try_get("", "count")?;
-                result.push((dow, count));
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let dow: i32 = row.try_get("", "day_of_week")?;
+                    let count: i64 = row.try_get("", "count")?;
+                    result.push((dow, count));
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取每日消息趋势（基于天数）
@@ -925,6 +1408,7 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<Vec<DailyStats>> {
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -934,19 +1418,22 @@ pub mod db {
                 group_id, start_time
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(DailyStats {
-                    date: row.try_get("", "date")?,
-                    count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(DailyStats {
+                        date: row.try_get("", "date")?,
+                        count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取每日消息趋势（基于日期范围）
@@ -965,19 +1452,22 @@ pub mod db {
                 group_id, start_ts, end_ts
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(DailyStats {
-                    date: row.try_get("", "date")?,
-                    count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(DailyStats {
+                        date: row.try_get("", "date")?,
+                        count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取活跃用户排行
@@ -987,6 +1477,8 @@ pub mod db {
             limit: u64,
             days: i64,
         ) -> anyhow::Result<Vec<UserActivity>> {
+            let limit = limit.min(limits::MAX_TOP_TALKERS_LIMIT);
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -998,20 +1490,23 @@ pub mod db {
                 group_id, start_time, limit
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(UserActivity {
-                    user_id: row.try_get("", "user_id")?,
-                    nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
-                    message_count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(UserActivity {
+                        user_id: row.try_get("", "user_id")?,
+                        nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
+                        message_count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取活跃用户排行（基于日期范围）
@@ -1022,6 +1517,7 @@ pub mod db {
             start_date: NaiveDate,
             end_date: NaiveDate,
         ) -> anyhow::Result<Vec<UserActivity>> {
+            let limit = limit.min(limits::MAX_TOP_TALKERS_LIMIT);
             let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
 
             let sql = format!(
@@ -1033,20 +1529,23 @@ pub mod db {
                 group_id, start_ts, end_ts, limit
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                result.push(UserActivity {
-                    user_id: row.try_get("", "user_id")?,
-                    nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
-                    message_count: row.try_get("", "count")?,
-                });
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(UserActivity {
+                        user_id: row.try_get("", "user_id")?,
+                        nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
+                        message_count: row.try_get("", "count")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
         }
 
         /// 获取消息类型分布
@@ -1055,6 +1554,7 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<MessageTypeStats> {
+            let days = days.min(limits::MAX_QUERY_DAYS);
             let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
 
             let sql = format!(
@@ -1069,23 +1569,36 @@ pub mod db {
                 group_id, start_time
             );
 
-            let row = self
-                .db
-                .query_one(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("No data"))?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let row = db
+                    .query_one(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("No data"))?;
 
-            Ok(MessageTypeStats {
-                total: row.try_get("", "total").unwrap_or(0),
-                text_only: row.try_get("", "text_only").unwrap_or(0),
-                with_image: row.try_get("", "with_image").unwrap_or(0),
-                with_at: row.try_get("", "with_at").unwrap_or(0),
-                with_reply: row.try_get("", "with_reply").unwrap_or(0),
+                Ok(MessageTypeStats {
+                    total: row.try_get("", "total").unwrap_or(0),
+                    text_only: row.try_get("", "text_only").unwrap_or(0),
+                    with_image: row.try_get("", "with_image").unwrap_or(0),
+                    with_at: row.try_get("", "with_at").unwrap_or(0),
+                    with_reply: row.try_get("", "with_reply").unwrap_or(0),
+                })
             })
+            .await
         }
 
-        /// 获取用户个人统计
+        /// 获取用户个人统计（带超时保护）
         pub async fn user_stats(
+            &self,
+            user_id: i64,
+            group_id: Option<i64>,
+        ) -> anyhow::Result<UserPersonalStats> {
+            self.query_with_timeout(|| self.user_stats_inner(user_id, group_id))
+                .await
+        }
+
+        /// 用户统计内部实现
+        async fn user_stats_inner(
             &self,
             user_id: i64,
             group_id: Option<i64>,
@@ -1095,7 +1608,12 @@ pub mod db {
                 None => String::new(),
             };
 
-            // 基本统计
+            let kw_group_filter = match group_id {
+                Some(gid) => format!("AND group_id = {}", gid),
+                None => String::new(),
+            };
+
+            // 合并多个查询为一个，减少数据库往返
             let sql = format!(
                 "SELECT \
                     COUNT(*) as total_messages, \
@@ -1110,7 +1628,7 @@ pub mod db {
 
             let row = self
                 .db
-                .query_one(Statement::from_string(DbBackend::Sqlite, sql.clone()))
+                .query_one(Statement::from_string(DbBackend::Sqlite, sql))
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("User not found"))?;
 
@@ -1130,10 +1648,7 @@ pub mod db {
             // 获取词汇总数
             let kw_sql = format!(
                 "SELECT COUNT(*) as count FROM keywords WHERE user_id = {} {}",
-                user_id,
-                group_id
-                    .map(|gid| format!("AND group_id = {}", gid))
-                    .unwrap_or_default()
+                user_id, kw_group_filter
             );
             let total_words: i64 = self
                 .db
@@ -1155,21 +1670,9 @@ pub mod db {
                 .await?
                 .and_then(|r| r.try_get("", "hour_of_day").ok());
 
-            // 获取群内排名（仅当指定了 group_id）
+            // 优化的排名计算
             let rank_in_group = if let Some(gid) = group_id {
-                let rank_sql = format!(
-                    "SELECT COUNT(*) + 1 as rank FROM ( \
-                        SELECT user_id, COUNT(*) as cnt FROM messages \
-                        WHERE group_id = {} GROUP BY user_id \
-                    ) WHERE cnt > ( \
-                        SELECT COUNT(*) FROM messages WHERE group_id = {} AND user_id = {} \
-                    )",
-                    gid, gid, user_id
-                );
-                self.db
-                    .query_one(Statement::from_string(DbBackend::Sqlite, rank_sql))
-                    .await?
-                    .and_then(|r| r.try_get("", "rank").ok())
+                self.calculate_user_rank(gid, user_id, total_messages).await
             } else {
                 None
             };
@@ -1186,6 +1689,43 @@ pub mod db {
                 favorite_hour,
                 rank_in_group,
             })
+        }
+
+        /// 优化的用户排名计算
+        async fn calculate_user_rank(
+            &self,
+            group_id: i64,
+            user_id: i64,
+            user_msg_count: i64,
+        ) -> Option<i64> {
+            let _ = user_id;
+            if user_msg_count == 0 {
+                return None;
+            }
+
+            // 只统计比该用户消息多的用户数量，添加 LIMIT 防止全表扫描
+            let rank_sql = format!(
+                "SELECT COUNT(*) as rank FROM ( \
+                    SELECT user_id FROM messages \
+                    WHERE group_id = {} \
+                    GROUP BY user_id \
+                    HAVING COUNT(*) > {} \
+                    LIMIT {} \
+                )",
+                group_id,
+                user_msg_count,
+                limits::MAX_RANK_SCAN_USERS
+            );
+
+            let rank: i64 = self
+                .db
+                .query_one(Statement::from_string(DbBackend::Sqlite, rank_sql))
+                .await
+                .ok()?
+                .and_then(|r| r.try_get("", "rank").ok())
+                .unwrap_or(0);
+
+            Some(rank + 1)
         }
 
         /// 获取时段对比数据
@@ -1209,28 +1749,31 @@ pub mod db {
                 group_id, cur_start_ts, cur_end_ts, group_id, prev_start_ts, prev_end_ts
             );
 
-            let row = self
-                .db
-                .query_one(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Query failed"))?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let row = db
+                    .query_one(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Query failed"))?;
 
-            let current_count: i64 = row.try_get("", "current_count").unwrap_or(0);
-            let previous_count: i64 = row.try_get("", "previous_count").unwrap_or(0);
+                let current_count: i64 = row.try_get("", "current_count").unwrap_or(0);
+                let previous_count: i64 = row.try_get("", "previous_count").unwrap_or(0);
 
-            let change_rate = if previous_count > 0 {
-                ((current_count - previous_count) as f64 / previous_count as f64) * 100.0
-            } else if current_count > 0 {
-                100.0
-            } else {
-                0.0
-            };
+                let change_rate = if previous_count > 0 {
+                    ((current_count - previous_count) as f64 / previous_count as f64) * 100.0
+                } else if current_count > 0 {
+                    100.0
+                } else {
+                    0.0
+                };
 
-            Ok(PeriodComparison {
-                current_count,
-                previous_count,
-                change_rate,
+                Ok(PeriodComparison {
+                    current_count,
+                    previous_count,
+                    change_rate,
+                })
             })
+            .await
         }
 
         /// 获取用户在各群的活跃度
@@ -1238,26 +1781,52 @@ pub mod db {
             let sql = format!(
                 "SELECT group_id, COUNT(*) as count FROM messages \
                  WHERE user_id = {} AND group_id IS NOT NULL \
-                 GROUP BY group_id ORDER BY count DESC",
-                user_id
+                 GROUP BY group_id ORDER BY count DESC LIMIT {}",
+                user_id,
+                limits::MAX_TOP_TALKERS_LIMIT
             );
 
-            let rows = self
-                .db
-                .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-                .await?;
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
 
-            let mut result = Vec::with_capacity(rows.len());
-            for row in rows {
-                let gid: i64 = row.try_get("", "group_id")?;
-                let count: i64 = row.try_get("", "count")?;
-                result.push((gid, count));
-            }
-            Ok(result)
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let gid: i64 = row.try_get("", "group_id")?;
+                    let count: i64 = row.try_get("", "count")?;
+                    result.push((gid, count));
+                }
+                Ok(result)
+            })
+            .await
         }
 
-        /// 获取存储统计概况
+        /// 获取存储统计概况（带缓存）
         pub async fn storage_stats(&self) -> StorageStats {
+            // 先检查缓存
+            {
+                let cache = self.storage_stats_cache.lock();
+                if let Some(cached) = cache.get() {
+                    return cached;
+                }
+            }
+
+            // 执行实际查询
+            let stats = self.storage_stats_uncached().await;
+
+            // 更新缓存
+            {
+                let mut cache = self.storage_stats_cache.lock();
+                cache.set(stats.clone());
+            }
+
+            stats
+        }
+
+        /// 不带缓存的存储统计查询
+        async fn storage_stats_uncached(&self) -> StorageStats {
             let msg_count = Messages::find().count(&self.db).await.unwrap_or(0);
             let kw_count = Keywords::find().count(&self.db).await.unwrap_or(0);
             let user_count = Users::find().count(&self.db).await.unwrap_or(0);
@@ -1288,14 +1857,22 @@ pub mod db {
             keyword: &str,
             limit: u64,
         ) -> anyhow::Result<Vec<messages::Model>> {
-            let results = Messages::find()
-                .filter(messages::Column::GroupId.eq(group_id))
-                .filter(messages::Column::CleanText.contains(keyword))
-                .order_by_desc(messages::Column::CreatedAt)
-                .limit(limit)
-                .all(&self.db)
-                .await?;
-            Ok(results)
+            let limit = limit.min(limits::MAX_SEARCH_LIMIT);
+
+            let db = self.db.clone();
+            let keyword = keyword.to_string();
+
+            self.query_with_timeout(|| async {
+                let results = Messages::find()
+                    .filter(messages::Column::GroupId.eq(group_id))
+                    .filter(messages::Column::CleanText.contains(&keyword))
+                    .order_by_desc(messages::Column::CreatedAt)
+                    .limit(limit)
+                    .all(&db)
+                    .await?;
+                Ok(results)
+            })
+            .await
         }
 
         /// 获取某用户的消息历史
@@ -1305,18 +1882,25 @@ pub mod db {
             group_id: Option<i64>,
             limit: u64,
         ) -> anyhow::Result<Vec<messages::Model>> {
-            let mut query = Messages::find().filter(messages::Column::UserId.eq(user_id));
+            let limit = limit.min(limits::MAX_USER_MESSAGES_LIMIT);
 
-            if let Some(gid) = group_id {
-                query = query.filter(messages::Column::GroupId.eq(gid));
-            }
+            let db = self.db.clone();
 
-            let results = query
-                .order_by_desc(messages::Column::CreatedAt)
-                .limit(limit)
-                .all(&self.db)
-                .await?;
-            Ok(results)
+            self.query_with_timeout(|| async {
+                let mut query = Messages::find().filter(messages::Column::UserId.eq(user_id));
+
+                if let Some(gid) = group_id {
+                    query = query.filter(messages::Column::GroupId.eq(gid));
+                }
+
+                let results = query
+                    .order_by_desc(messages::Column::CreatedAt)
+                    .limit(limit)
+                    .all(&db)
+                    .await?;
+                Ok(results)
+            })
+            .await
         }
     }
 }
@@ -1339,7 +1923,6 @@ pub async fn get_logger() -> Option<Arc<db::Logger>> {
 #[kovi::plugin]
 async fn main() {
     let bot = PluginBuilder::get_runtime_bot();
-    // 克隆 bot 实例以便传入闭包
     let bot_clone = bot.clone();
 
     let data_dir = bot.get_data_path();
@@ -1350,7 +1933,7 @@ async fn main() {
     let logger = Arc::new(db::Logger::new(data_dir).await);
     LOGGER.set(logger.clone()).ok();
 
-    kovi::log::info!("[msg-logger] 消息记录器已启动");
+    kovi::log::info!("[msg-logger] 消息记录器已启动（优化版）");
 
     PluginBuilder::on_msg(move |event| {
         let logger = logger.clone();
@@ -1358,13 +1941,16 @@ async fn main() {
         let bot = bot_clone.clone();
 
         async move {
-            // 判断是否需要记录
-            let should_record = {
+            // 一次性获取快照，立即释放锁
+            let snapshot = {
                 let cfg = config_lock.read();
-                match event.group_id {
-                    Some(gid) => cfg.should_record_group(gid),
-                    None => cfg.should_record_private(),
-                }
+                cfg.snapshot()
+            }; // 锁在这里立即释放
+
+            // 判断是否需要记录（使用快照，无锁）
+            let should_record = match event.group_id {
+                Some(gid) => snapshot.should_record_group(gid),
+                None => snapshot.should_record_private(),
             };
 
             if should_record {
@@ -1389,20 +1975,16 @@ async fn main() {
 
             let group_id = event.group_id.unwrap();
             let sender_role = event.sender.role.as_deref();
+            let bot_admins = bot.get_all_admin().unwrap_or_default();
 
             match text {
                 "开启记录" => {
-                    let bot_admins = bot.get_all_admin().unwrap_or_default();
-
-                    let is_admin = {
-                        let cfg = config_lock.read();
-                        // 传入 bot_admins
-                        cfg.is_admin(event.user_id, sender_role, &bot_admins)
-                    };
-                    if !is_admin {
+                    // 使用快照检查权限（无锁）
+                    if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
                         event.reply("⚠️ 仅管理员可操作");
                         return;
                     }
+                    // 只有需要修改时才获取写锁
                     let msg = {
                         let mut cfg = config_lock.write();
                         cfg.enable_group(group_id)
@@ -1410,15 +1992,7 @@ async fn main() {
                     event.reply(msg);
                 }
                 "关闭记录" => {
-                    // 获取全局管理员列表
-                    let bot_admins = bot.get_all_admin().unwrap_or_default();
-
-                    let is_admin = {
-                        let cfg = config_lock.read();
-                        // 传入 bot_admins
-                        cfg.is_admin(event.user_id, sender_role, &bot_admins)
-                    };
-                    if !is_admin {
+                    if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
                         event.reply("⚠️ 仅管理员可操作");
                         return;
                     }
@@ -1429,7 +2003,7 @@ async fn main() {
                     event.reply(msg);
                 }
                 "记录状态" => {
-                    handle_status(group_id, &event, &logger, &config_lock).await;
+                    handle_status(group_id, &event, &logger, &snapshot).await;
                 }
                 _ => {}
             }
@@ -1441,17 +2015,14 @@ async fn handle_status(
     group_id: i64,
     event: &Arc<kovi::MsgEvent>,
     logger: &Arc<db::Logger>,
-    config_lock: &Arc<parking_lot::RwLock<config::Config>>,
+    snapshot: &config::ConfigSnapshot,
 ) {
     let stats = logger.query().storage_stats().await;
 
-    let status = {
-        let cfg = config_lock.read();
-        if cfg.should_record_group(group_id) {
-            "🟢 开启中"
-        } else {
-            "🔴 关闭中"
-        }
+    let status = if snapshot.should_record_group(group_id) {
+        "🟢 开启中"
+    } else {
+        "🔴 关闭中"
     };
 
     let msg = format!(
