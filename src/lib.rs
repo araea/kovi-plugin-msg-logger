@@ -1292,11 +1292,11 @@ pub mod db {
 
             let sql = format!(
                 "SELECT word, COUNT(*) as cnt \
-                 FROM keywords \
-                 WHERE user_id = {} AND created_at >= {} {} \
-                 GROUP BY word \
-                 ORDER BY cnt DESC \
-                 LIMIT {}",
+                        FROM keywords \
+                        WHERE user_id = {} AND created_at >= {} {} \
+                        GROUP BY word \
+                        ORDER BY cnt DESC \
+                        LIMIT {}",
                 user_id, start_time, group_filter, limit
             );
 
@@ -1337,11 +1337,11 @@ pub mod db {
 
             let sql = format!(
                 "SELECT word, COUNT(*) as cnt \
-                 FROM keywords \
-                 WHERE user_id = {} AND created_at BETWEEN {} AND {} {} \
-                 GROUP BY word \
-                 ORDER BY cnt DESC \
-                 LIMIT {}",
+                       FROM keywords \
+                       WHERE user_id = {} AND created_at BETWEEN {} AND {} {} \
+                       GROUP BY word \
+                       ORDER BY cnt DESC \
+                       LIMIT {}",
                 user_id, start_ts, end_ts, group_filter, limit
             );
 
@@ -1373,10 +1373,10 @@ pub mod db {
 
             let sql = format!(
                 "SELECT hour_of_day, COUNT(*) as cnt \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at >= {} \
-                 GROUP BY hour_of_day \
-                 ORDER BY hour_of_day",
+                       FROM messages \
+                       WHERE group_id = {} AND created_at >= {} \
+                       GROUP BY hour_of_day \
+                       ORDER BY hour_of_day",
                 group_id, start_time
             );
 
@@ -1409,10 +1409,10 @@ pub mod db {
 
             let sql = format!(
                 "SELECT hour_of_day, COUNT(*) as cnt \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at BETWEEN {} AND {} \
-                 GROUP BY hour_of_day \
-                 ORDER BY hour_of_day",
+                       FROM messages \
+                       WHERE group_id = {} AND created_at BETWEEN {} AND {} \
+                       GROUP BY hour_of_day \
+                       ORDER BY hour_of_day",
                 group_id, start_ts, end_ts
             );
 
@@ -1444,9 +1444,9 @@ pub mod db {
 
             let sql = format!(
                 "SELECT day_of_week, hour_of_day, COUNT(*) as cnt \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at >= {} \
-                 GROUP BY day_of_week, hour_of_day",
+                      FROM messages \
+                      WHERE group_id = {} AND created_at >= {} \
+                      GROUP BY day_of_week, hour_of_day",
                 group_id, start_time
             );
 
@@ -1481,9 +1481,9 @@ pub mod db {
 
             let sql = format!(
                 "SELECT day_of_week, hour_of_day, COUNT(*) as cnt \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at BETWEEN {} AND {} \
-                 GROUP BY day_of_week, hour_of_day",
+                      FROM messages \
+                      WHERE group_id = {} AND created_at BETWEEN {} AND {} \
+                      GROUP BY day_of_week, hour_of_day",
                 group_id, start_ts, end_ts
             );
 
@@ -1507,6 +1507,40 @@ pub mod db {
             .await
         }
 
+        /// 获取星期活跃分布
+        pub async fn weekly_distribution(
+            &self,
+            group_id: i64,
+            days: i64,
+        ) -> anyhow::Result<Vec<(i32, i64)>> {
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
+
+            let sql = format!(
+                "SELECT day_of_week, COUNT(*) as cnt \
+                 FROM messages \
+                 WHERE group_id = {} AND created_at >= {} \
+                 GROUP BY day_of_week \
+                 ORDER BY day_of_week",
+                group_id, start_time
+            );
+
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
+
+                let mut result = Vec::with_capacity(7);
+                for row in rows {
+                    let dow: i32 = row.try_get("", "day_of_week")?;
+                    let count: i64 = row.try_get("", "cnt")?;
+                    result.push((dow, count));
+                }
+                Ok(result)
+            })
+            .await
+        }
+
         /// 获取星期活跃分布（基于日期范围）
         pub async fn weekly_distribution_range(
             &self,
@@ -1518,10 +1552,10 @@ pub mod db {
 
             let sql = format!(
                 "SELECT day_of_week, COUNT(*) as cnt \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at BETWEEN {} AND {} \
-                 GROUP BY day_of_week \
-                 ORDER BY day_of_week",
+                       FROM messages \
+                       WHERE group_id = {} AND created_at BETWEEN {} AND {} \
+                       GROUP BY day_of_week \
+                       ORDER BY day_of_week",
                 group_id, start_ts, end_ts
             );
 
@@ -1542,6 +1576,162 @@ pub mod db {
             .await
         }
 
+        /// 获取每日消息趋势（基于天数）
+        pub async fn daily_trend(
+            &self,
+            group_id: i64,
+            days: i64,
+        ) -> anyhow::Result<Vec<DailyStats>> {
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
+
+            let sql = format!(
+                "SELECT date(created_at, 'unixepoch', 'localtime') as dt, COUNT(*) as cnt \
+                 FROM messages \
+                 WHERE group_id = {} AND created_at >= {} \
+                 GROUP BY dt \
+                 ORDER BY dt",
+                group_id, start_time
+            );
+
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
+
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(DailyStats {
+                        date: row.try_get("", "dt")?,
+                        count: row.try_get("", "cnt")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
+        }
+
+        /// 获取每日消息趋势（基于日期范围）
+        pub async fn daily_trend_range(
+            &self,
+            group_id: i64,
+            start_date: NaiveDate,
+            end_date: NaiveDate,
+        ) -> anyhow::Result<Vec<DailyStats>> {
+            let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
+
+            let sql = format!(
+                "SELECT date(created_at, 'unixepoch', 'localtime') as dt, COUNT(*) as cnt \
+                 FROM messages \
+                 WHERE group_id = {} AND created_at BETWEEN {} AND {} \
+                 GROUP BY dt \
+                 ORDER BY dt",
+                group_id, start_ts, end_ts
+            );
+
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
+
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(DailyStats {
+                        date: row.try_get("", "dt")?,
+                        count: row.try_get("", "cnt")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
+        }
+
+        /// 获取活跃用户排行
+        pub async fn top_talkers(
+            &self,
+            group_id: i64,
+            limit: u64,
+            days: i64,
+        ) -> anyhow::Result<Vec<UserActivity>> {
+            let limit = limit.min(limits::MAX_TOP_TALKERS_LIMIT);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
+
+            let sql = format!(
+                "SELECT m.user_id, \
+                        COALESCE(u.nickname, m.sender_nickname, '') as nickname, \
+                        COUNT(*) as cnt \
+                 FROM messages m \
+                 LEFT JOIN users u ON m.user_id = u.user_id \
+                 WHERE m.group_id = {} AND m.created_at >= {} \
+                 GROUP BY m.user_id \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
+                group_id, start_time, limit
+            );
+
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
+
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(UserActivity {
+                        user_id: row.try_get("", "user_id")?,
+                        nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
+                        message_count: row.try_get("", "cnt")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
+        }
+
+        /// 获取活跃用户排行（基于日期范围）
+        pub async fn top_talkers_range(
+            &self,
+            group_id: i64,
+            limit: u64,
+            start_date: NaiveDate,
+            end_date: NaiveDate,
+        ) -> anyhow::Result<Vec<UserActivity>> {
+            let limit = limit.min(limits::MAX_TOP_TALKERS_LIMIT);
+            let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
+
+            let sql = format!(
+                "SELECT m.user_id, \
+                        COALESCE(u.nickname, m.sender_nickname, '') as nickname, \
+                        COUNT(*) as cnt \
+                 FROM messages m \
+                 LEFT JOIN users u ON m.user_id = u.user_id \
+                 WHERE m.group_id = {} AND m.created_at BETWEEN {} AND {} \
+                 GROUP BY m.user_id \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
+                group_id, start_ts, end_ts, limit
+            );
+
+            let db = self.db.clone();
+            self.query_with_timeout(|| async {
+                let rows = db
+                    .query_all(Statement::from_string(DbBackend::Sqlite, sql))
+                    .await?;
+
+                let mut result = Vec::with_capacity(rows.len());
+                for row in rows {
+                    result.push(UserActivity {
+                        user_id: row.try_get("", "user_id")?,
+                        nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
+                        message_count: row.try_get("", "cnt")?,
+                    });
+                }
+                Ok(result)
+            })
+            .await
+        }
+
         /// 获取消息类型分布
         pub async fn message_type_stats(
             &self,
@@ -1552,13 +1742,13 @@ pub mod db {
 
             let sql = format!(
                 "SELECT \
-                    COUNT(*) as total, \
-                    SUM(CASE WHEN NOT has_image AND NOT has_at AND NOT is_reply THEN 1 ELSE 0 END) as text_only, \
-                    SUM(CASE WHEN has_image THEN 1 ELSE 0 END) as with_image, \
-                    SUM(CASE WHEN has_at THEN 1 ELSE 0 END) as with_at, \
-                    SUM(CASE WHEN is_reply THEN 1 ELSE 0 END) as with_reply \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at >= {}",
+                          COUNT(*) as total, \
+                          SUM(CASE WHEN NOT has_image AND NOT has_at AND NOT is_reply THEN 1 ELSE 0 END) as text_only, \
+                          SUM(CASE WHEN has_image THEN 1 ELSE 0 END) as with_image, \
+                          SUM(CASE WHEN has_at THEN 1 ELSE 0 END) as with_at, \
+                          SUM(CASE WHEN is_reply THEN 1 ELSE 0 END) as with_reply \
+                       FROM messages \
+                       WHERE group_id = {} AND created_at >= {}",
                 group_id, start_time
             );
 
@@ -1591,13 +1781,13 @@ pub mod db {
 
             let sql = format!(
                 "SELECT \
-                    COUNT(*) as total, \
-                    SUM(CASE WHEN NOT has_image AND NOT has_at AND NOT is_reply THEN 1 ELSE 0 END) as text_only, \
-                    SUM(CASE WHEN has_image THEN 1 ELSE 0 END) as with_image, \
-                    SUM(CASE WHEN has_at THEN 1 ELSE 0 END) as with_at, \
-                    SUM(CASE WHEN is_reply THEN 1 ELSE 0 END) as with_reply \
-                 FROM messages \
-                 WHERE group_id = {} AND created_at BETWEEN {} AND {}",
+                          COUNT(*) as total, \
+                          SUM(CASE WHEN NOT has_image AND NOT has_at AND NOT is_reply THEN 1 ELSE 0 END) as text_only, \
+                          SUM(CASE WHEN has_image THEN 1 ELSE 0 END) as with_image, \
+                          SUM(CASE WHEN has_at THEN 1 ELSE 0 END) as with_at, \
+                          SUM(CASE WHEN is_reply THEN 1 ELSE 0 END) as with_reply \
+                       FROM messages \
+                       WHERE group_id = {} AND created_at BETWEEN {} AND {}",
                 group_id, start_ts, end_ts
             );
 
