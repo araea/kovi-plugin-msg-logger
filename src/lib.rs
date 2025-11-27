@@ -452,8 +452,8 @@ pub mod db {
     use sea_orm::sea_query::OnConflict;
     use sea_orm::{
         ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, Database, DatabaseConnection,
-        DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Schema,
-        Statement, TransactionTrait,
+        DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Schema, Statement,
+        TransactionTrait,
     };
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -478,8 +478,6 @@ pub mod db {
         pub const MAX_USER_MESSAGES_LIMIT: u64 = 1000;
         /// 最大查询天数
         pub const MAX_QUERY_DAYS: i64 = 365;
-        /// 排名计算最大扫描用户数
-        pub const MAX_RANK_SCAN_USERS: i64 = 10000;
         /// 默认查询超时（秒）
         pub const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
         /// 批量写入缓冲区大小
@@ -488,6 +486,8 @@ pub mod db {
         pub const WRITE_BATCH_THRESHOLD: usize = 50;
         /// 批量写入间隔（毫秒）
         pub const WRITE_FLUSH_INTERVAL_MS: u64 = 500;
+        /// 每秒的秒数（用于安全计算时间偏移）
+        pub const SECONDS_PER_DAY: i64 = 86400;
     }
 
     // =============================
@@ -603,16 +603,20 @@ pub mod db {
                 Ok(t) => t,
                 Err(e) => {
                     kovi::log::error!("[msg-logger] 事务开始失败: {}", e);
-                    // 不清空 buffer，下次重试
                     return;
                 }
             };
 
             let mut success = true;
+            let mut all_keywords: Vec<keywords::ActiveModel> = Vec::new();
+            let mut message_id_map: Vec<(usize, usize)> = Vec::new(); // (buffer_idx, keywords_start_idx)
 
-            for write in buffer.iter() {
-                // 插入用户
-                if let Err(e) = users::Entity::insert(write.user_upsert.clone())
+            // 先批量插入用户
+            let user_models: Vec<users::ActiveModel> =
+                buffer.iter().map(|w| w.user_upsert.clone()).collect();
+
+            for user_model in user_models {
+                if let Err(e) = users::Entity::insert(user_model)
                     .on_conflict(
                         OnConflict::column(users::Column::UserId)
                             .update_column(users::Column::Nickname)
@@ -630,8 +634,15 @@ pub mod db {
                     success = false;
                     break;
                 }
+            }
 
-                // 插入消息 - use insert() on ActiveModel to get the returned ID
+            if !success {
+                let _ = txn.rollback().await;
+                return;
+            }
+
+            // 逐条插入消息并收集关键词
+            for (idx, write) in buffer.iter().enumerate() {
                 let inserted = match write.message.clone().insert(&txn).await {
                     Ok(m) => m,
                     Err(e) => {
@@ -640,21 +651,31 @@ pub mod db {
                         break;
                     }
                 };
+
                 let db_id = inserted.id;
+                let kw_start = all_keywords.len();
 
-                // 插入关键词 - update message_id with actual ID
-                if !write.keywords.is_empty() {
-                    let keywords_with_id: Vec<keywords::ActiveModel> = write
-                        .keywords
-                        .iter()
-                        .map(|kw| {
-                            let mut kw = kw.clone();
-                            kw.message_id = ActiveValue::Set(db_id);
-                            kw
-                        })
-                        .collect();
+                // 更新关键词的 message_id
+                for kw in &write.keywords {
+                    let mut kw = kw.clone();
+                    kw.message_id = ActiveValue::Set(db_id);
+                    all_keywords.push(kw);
+                }
 
-                    if let Err(e) = keywords::Entity::insert_many(keywords_with_id)
+                message_id_map.push((idx, kw_start));
+            }
+
+            if !success {
+                let _ = txn.rollback().await;
+                return;
+            }
+
+            // 批量插入所有关键词
+            if !all_keywords.is_empty() {
+                // 分批插入，每批最多 500 条
+                const KEYWORD_BATCH_SIZE: usize = 500;
+                for chunk in all_keywords.chunks(KEYWORD_BATCH_SIZE) {
+                    if let Err(e) = keywords::Entity::insert_many(chunk.to_vec())
                         .exec(&txn)
                         .await
                     {
@@ -672,13 +693,12 @@ pub mod db {
                     buffer.clear();
                 }
             } else {
-                // 回滚事务
-                if let Err(e) = txn.rollback().await {
-                    kovi::log::error!("[msg-logger] 事务回滚失败: {}", e);
-                }
-                // 保留 buffer 以便重试，但为防止无限重试，只保留部分
-                if buffer.len() > limits::WRITE_BATCH_THRESHOLD {
-                    buffer.drain(0..limits::WRITE_BATCH_THRESHOLD);
+                let _ = txn.rollback().await;
+                // 失败时只清空部分，防止无限重试导致内存问题
+                if buffer.len() > limits::WRITE_BATCH_THRESHOLD * 2 {
+                    let drain_count = buffer.len() / 2;
+                    buffer.drain(0..drain_count);
+                    kovi::log::warn!("[msg-logger] 批量写入失败，丢弃 {} 条消息", drain_count);
                 }
             }
         }
@@ -712,8 +732,7 @@ pub mod db {
             let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
 
             let mut opt = sea_orm::ConnectOptions::new(db_url);
-            opt.sqlx_logging(false)
-                // 连接池配置
+            opt.sqlx_logging(true)
                 .max_connections(10)
                 .min_connections(2)
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -756,23 +775,18 @@ pub mod db {
                 .execute(builder.build(schema.create_table_from_entity(Users).if_not_exists()))
                 .await;
 
+            // 优化后的索引：移除冗余索引，保留必要的复合索引
             let indexes = [
-                // 基础索引
-                "CREATE INDEX IF NOT EXISTS idx_messages_group_id ON messages(group_id)",
-                "CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)",
+                // messages 表核心索引
                 "CREATE INDEX IF NOT EXISTS idx_messages_group_time ON messages(group_id, created_at)",
-                "CREATE INDEX IF NOT EXISTS idx_messages_group_user_time ON messages(group_id, user_id, created_at)",
-                "CREATE INDEX IF NOT EXISTS idx_messages_dow_hour ON messages(day_of_week, hour_of_day)",
-                "CREATE INDEX IF NOT EXISTS idx_keywords_word ON keywords(word)",
-                "CREATE INDEX IF NOT EXISTS idx_keywords_group_id ON keywords(group_id)",
-                "CREATE INDEX IF NOT EXISTS idx_keywords_group_time ON keywords(group_id, created_at)",
-                "CREATE INDEX IF NOT EXISTS idx_keywords_user_id ON keywords(user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_messages_group_user_count ON messages(group_id, user_id)",
-                "CREATE INDEX IF NOT EXISTS idx_messages_user_group ON messages(user_id, group_id)",
-                "CREATE INDEX IF NOT EXISTS idx_keywords_user_group_time ON keywords(user_id, group_id, created_at)",
-                // 用户小时分布索引
+                "CREATE INDEX IF NOT EXISTS idx_messages_user_group_time ON messages(user_id, group_id, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_messages_group_dow_hour ON messages(group_id, day_of_week, hour_of_day)",
                 "CREATE INDEX IF NOT EXISTS idx_messages_user_hour ON messages(user_id, hour_of_day)",
+                // keywords 表核心索引
+                "CREATE INDEX IF NOT EXISTS idx_keywords_group_word_time ON keywords(group_id, word, created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_keywords_user_group_time ON keywords(user_id, group_id, created_at)",
+                // 用于消息类型统计的覆盖索引
+                "CREATE INDEX IF NOT EXISTS idx_messages_group_flags ON messages(group_id, created_at, has_image, has_at, is_reply)",
             ];
 
             for sql in indexes {
@@ -784,10 +798,10 @@ pub mod db {
             let pragmas = [
                 "PRAGMA journal_mode=WAL",
                 "PRAGMA synchronous=NORMAL",
-                "PRAGMA cache_size=-64000", // 64MB 缓存
+                "PRAGMA cache_size=-64000",
                 "PRAGMA temp_store=MEMORY",
-                "PRAGMA mmap_size=268435456", // 256MB 内存映射
-                "PRAGMA busy_timeout=5000",   // 5秒锁等待超时
+                "PRAGMA mmap_size=268435456",
+                "PRAGMA busy_timeout=5000",
             ];
 
             for pragma in pragmas {
@@ -853,7 +867,6 @@ pub mod db {
                 ..Default::default()
             };
 
-            // 准备用户数据
             let nickname = event.sender.nickname.clone().unwrap_or_default();
             let user_model = users::ActiveModel {
                 user_id: ActiveValue::Set(event.user_id),
@@ -863,14 +876,12 @@ pub mod db {
                 message_count: ActiveValue::Set(1),
             };
 
-            // 获取配置快照（快速释放锁）
             let snapshot = {
                 let cfg = config::get();
                 let cfg_read = cfg.read();
                 cfg_read.snapshot()
             };
 
-            // 准备关键词数据
             let keywords = if snapshot.tokenizer_enabled && !msg_text.trim().is_empty() {
                 let jieba = self.jieba.clone();
                 let group_id = event.group_id;
@@ -881,7 +892,6 @@ pub mod db {
                     let words = jieba.cut(&msg_text, true);
                     let max_word_len = 20;
 
-                    // 使用 HashMap 聚合相同词，去重
                     let mut word_set: HashMap<String, i32> = HashMap::new();
 
                     for w in words {
@@ -899,7 +909,7 @@ pub mod db {
                 keywords_data
                     .into_iter()
                     .map(|(word, word_length)| keywords::ActiveModel {
-                        message_id: ActiveValue::Set(0), // 将在批量写入时更新
+                        message_id: ActiveValue::Set(0),
                         word: ActiveValue::Set(word),
                         word_length: ActiveValue::Set(word_length),
                         group_id: ActiveValue::Set(group_id),
@@ -912,7 +922,6 @@ pub mod db {
                 Vec::new()
             };
 
-            // 发送到写入缓冲区
             let pending = PendingWrite {
                 message: msg_model,
                 keywords,
@@ -920,7 +929,6 @@ pub mod db {
             };
 
             if let Err(e) = self.write_buffer.send(pending).await {
-                // 如果缓冲区满，回退到直接写入
                 kovi::log::warn!("[msg-logger] 写入缓冲区满，直接写入: {}", e);
                 self.direct_write(event, created_at, hour_of_day, day_of_week)
                     .await?;
@@ -929,7 +937,6 @@ pub mod db {
             Ok(())
         }
 
-        /// 直接写入（回退方案）
         async fn direct_write(
             &self,
             event: &Arc<MsgEvent>,
@@ -980,7 +987,6 @@ pub mod db {
                 ..Default::default()
             };
 
-            // Upsert 用户
             let nickname = event.sender.nickname.clone().unwrap_or_default();
             let user_model = users::ActiveModel {
                 user_id: ActiveValue::Set(event.user_id),
@@ -1004,11 +1010,9 @@ pub mod db {
                 .exec(&self.db)
                 .await?;
 
-            // 插入消息
             let inserted = msg_model.insert(&self.db).await?;
             let db_id = inserted.id;
 
-            // 获取配置快照
             let snapshot = {
                 let cfg = config::get();
                 let cfg_read = cfg.read();
@@ -1067,14 +1071,12 @@ pub mod db {
     //       Query API Types
     // =============================
 
-    /// 词频统计结果
     #[derive(Debug, Clone)]
     pub struct WordCount {
         pub word: String,
         pub count: i64,
     }
 
-    /// 用户活跃统计
     #[derive(Debug, Clone)]
     pub struct UserActivity {
         pub user_id: i64,
@@ -1082,21 +1084,18 @@ pub mod db {
         pub message_count: i64,
     }
 
-    /// 时段统计
     #[derive(Debug, Clone)]
     pub struct HourlyStats {
         pub hour: i32,
         pub count: i64,
     }
 
-    /// 每日统计
     #[derive(Debug, Clone)]
     pub struct DailyStats {
         pub date: String,
         pub count: i64,
     }
 
-    /// 存储统计
     #[derive(Debug, Clone)]
     pub struct StorageStats {
         pub total_messages: u64,
@@ -1105,7 +1104,6 @@ pub mod db {
         pub groups_tracked: u64,
     }
 
-    /// 消息类型分布
     #[derive(Debug, Clone, Default)]
     pub struct MessageTypeStats {
         pub text_only: i64,
@@ -1115,7 +1113,6 @@ pub mod db {
         pub total: i64,
     }
 
-    /// 用户个人统计
     #[derive(Debug, Clone)]
     pub struct UserPersonalStats {
         pub user_id: i64,
@@ -1130,7 +1127,6 @@ pub mod db {
         pub rank_in_group: Option<i64>,
     }
 
-    /// 时段对比结果
     #[derive(Debug, Clone)]
     pub struct PeriodComparison {
         pub current_count: i64,
@@ -1152,11 +1148,17 @@ pub mod db {
         fn new(db: DatabaseConnection) -> Self {
             Self {
                 db,
-                storage_stats_cache: Arc::new(Mutex::new(QueryCache::new(60))), // 60秒缓存
+                storage_stats_cache: Arc::new(Mutex::new(QueryCache::new(60))),
             }
         }
 
-        /// 计算时间戳范围 (start_date 00:00:00 到 end_date 23:59:59)
+        /// 安全计算时间偏移，防止溢出
+        fn safe_time_offset(days: i64) -> i64 {
+            let days = days.min(limits::MAX_QUERY_DAYS);
+            days.saturating_mul(limits::SECONDS_PER_DAY)
+        }
+
+        /// 计算时间戳范围
         fn date_range_to_timestamps(start: NaiveDate, end: NaiveDate) -> (i64, i64) {
             use kovi::chrono::{Local, NaiveTime};
 
@@ -1180,7 +1182,6 @@ pub mod db {
             (start_ts, end_ts)
         }
 
-        /// 带超时的查询执行
         async fn query_with_timeout<T, F, Fut>(&self, f: F) -> anyhow::Result<T>
         where
             F: FnOnce() -> Fut,
@@ -1195,7 +1196,7 @@ pub mod db {
             })?
         }
 
-        /// 获取词云数据（基于天数，从今天往前）
+        /// 获取词云数据（基于天数）
         pub async fn word_cloud(
             &self,
             group_id: i64,
@@ -1203,13 +1204,16 @@ pub mod db {
             days: i64,
         ) -> anyhow::Result<Vec<WordCount>> {
             let limit = limit.min(limits::MAX_WORD_CLOUD_LIMIT);
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
+            // 使用参数化格式，值已经过类型验证（i64/u64）
             let sql = format!(
-                "SELECT word, COUNT(*) as count FROM keywords \
+                "SELECT word, COUNT(*) as cnt \
+                 FROM keywords \
                  WHERE group_id = {} AND created_at >= {} \
-                 GROUP BY word ORDER BY count DESC LIMIT {}",
+                 GROUP BY word \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
                 group_id, start_time, limit
             );
 
@@ -1223,7 +1227,7 @@ pub mod db {
                 for row in rows {
                     result.push(WordCount {
                         word: row.try_get("", "word")?,
-                        count: row.try_get("", "count")?,
+                        count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1243,9 +1247,12 @@ pub mod db {
             let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
 
             let sql = format!(
-                "SELECT word, COUNT(*) as count FROM keywords \
-                 WHERE group_id = {} AND created_at >= {} AND created_at <= {} \
-                 GROUP BY word ORDER BY count DESC LIMIT {}",
+                "SELECT word, COUNT(*) as cnt \
+                 FROM keywords \
+                 WHERE group_id = {} AND created_at BETWEEN {} AND {} \
+                 GROUP BY word \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
                 group_id, start_ts, end_ts, limit
             );
 
@@ -1259,7 +1266,7 @@ pub mod db {
                 for row in rows {
                     result.push(WordCount {
                         word: row.try_get("", "word")?,
-                        count: row.try_get("", "count")?,
+                        count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1276,8 +1283,7 @@ pub mod db {
             days: i64,
         ) -> anyhow::Result<Vec<WordCount>> {
             let limit = limit.min(limits::MAX_WORD_CLOUD_LIMIT);
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
             let group_filter = match group_id {
                 Some(gid) => format!("AND group_id = {}", gid),
@@ -1285,9 +1291,12 @@ pub mod db {
             };
 
             let sql = format!(
-                "SELECT word, COUNT(*) as count FROM keywords \
+                "SELECT word, COUNT(*) as cnt \
+                 FROM keywords \
                  WHERE user_id = {} AND created_at >= {} {} \
-                 GROUP BY word ORDER BY count DESC LIMIT {}",
+                 GROUP BY word \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
                 user_id, start_time, group_filter, limit
             );
 
@@ -1301,7 +1310,7 @@ pub mod db {
                 for row in rows {
                     result.push(WordCount {
                         word: row.try_get("", "word")?,
-                        count: row.try_get("", "count")?,
+                        count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1315,13 +1324,14 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<Vec<HourlyStats>> {
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
             let sql = format!(
-                "SELECT hour_of_day as hour, COUNT(*) as count FROM messages \
+                "SELECT hour_of_day, COUNT(*) as cnt \
+                 FROM messages \
                  WHERE group_id = {} AND created_at >= {} \
-                 GROUP BY hour_of_day ORDER BY hour_of_day",
+                 GROUP BY hour_of_day \
+                 ORDER BY hour_of_day",
                 group_id, start_time
             );
 
@@ -1331,11 +1341,11 @@ pub mod db {
                     .query_all(Statement::from_string(DbBackend::Sqlite, sql))
                     .await?;
 
-                let mut result = Vec::with_capacity(rows.len());
+                let mut result = Vec::with_capacity(24);
                 for row in rows {
                     result.push(HourlyStats {
-                        hour: row.try_get("", "hour")?,
-                        count: row.try_get("", "count")?,
+                        hour: row.try_get("", "hour_of_day")?,
+                        count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1349,11 +1359,11 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<[[i64; 24]; 7]> {
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
             let sql = format!(
-                "SELECT day_of_week, hour_of_day, COUNT(*) as count FROM messages \
+                "SELECT day_of_week, hour_of_day, COUNT(*) as cnt \
+                 FROM messages \
                  WHERE group_id = {} AND created_at >= {} \
                  GROUP BY day_of_week, hour_of_day",
                 group_id, start_time
@@ -1369,7 +1379,7 @@ pub mod db {
                 for row in rows {
                     let dow: i32 = row.try_get("", "day_of_week")?;
                     let hour: i32 = row.try_get("", "hour_of_day")?;
-                    let count: i64 = row.try_get("", "count")?;
+                    let count: i64 = row.try_get("", "cnt")?;
                     if (0..7).contains(&dow) && (0..24).contains(&hour) {
                         grid[dow as usize][hour as usize] = count;
                     }
@@ -1385,13 +1395,14 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<Vec<(i32, i64)>> {
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
             let sql = format!(
-                "SELECT day_of_week, COUNT(*) as count FROM messages \
+                "SELECT day_of_week, COUNT(*) as cnt \
+                 FROM messages \
                  WHERE group_id = {} AND created_at >= {} \
-                 GROUP BY day_of_week ORDER BY day_of_week",
+                 GROUP BY day_of_week \
+                 ORDER BY day_of_week",
                 group_id, start_time
             );
 
@@ -1401,10 +1412,10 @@ pub mod db {
                     .query_all(Statement::from_string(DbBackend::Sqlite, sql))
                     .await?;
 
-                let mut result = Vec::with_capacity(rows.len());
+                let mut result = Vec::with_capacity(7);
                 for row in rows {
                     let dow: i32 = row.try_get("", "day_of_week")?;
-                    let count: i64 = row.try_get("", "count")?;
+                    let count: i64 = row.try_get("", "cnt")?;
                     result.push((dow, count));
                 }
                 Ok(result)
@@ -1418,13 +1429,14 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<Vec<DailyStats>> {
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
             let sql = format!(
-                "SELECT date(created_at, 'unixepoch', 'localtime') as date, COUNT(*) as count \
-                 FROM messages WHERE group_id = {} AND created_at >= {} \
-                 GROUP BY date ORDER BY date",
+                "SELECT date(created_at, 'unixepoch', 'localtime') as dt, COUNT(*) as cnt \
+                 FROM messages \
+                 WHERE group_id = {} AND created_at >= {} \
+                 GROUP BY dt \
+                 ORDER BY dt",
                 group_id, start_time
             );
 
@@ -1437,8 +1449,8 @@ pub mod db {
                 let mut result = Vec::with_capacity(rows.len());
                 for row in rows {
                     result.push(DailyStats {
-                        date: row.try_get("", "date")?,
-                        count: row.try_get("", "count")?,
+                        date: row.try_get("", "dt")?,
+                        count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1456,9 +1468,11 @@ pub mod db {
             let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
 
             let sql = format!(
-                "SELECT date(created_at, 'unixepoch', 'localtime') as date, COUNT(*) as count \
-                 FROM messages WHERE group_id = {} AND created_at >= {} AND created_at <= {} \
-                 GROUP BY date ORDER BY date",
+                "SELECT date(created_at, 'unixepoch', 'localtime') as dt, COUNT(*) as cnt \
+                 FROM messages \
+                 WHERE group_id = {} AND created_at BETWEEN {} AND {} \
+                 GROUP BY dt \
+                 ORDER BY dt",
                 group_id, start_ts, end_ts
             );
 
@@ -1471,8 +1485,8 @@ pub mod db {
                 let mut result = Vec::with_capacity(rows.len());
                 for row in rows {
                     result.push(DailyStats {
-                        date: row.try_get("", "date")?,
-                        count: row.try_get("", "count")?,
+                        date: row.try_get("", "dt")?,
+                        count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1488,15 +1502,18 @@ pub mod db {
             days: i64,
         ) -> anyhow::Result<Vec<UserActivity>> {
             let limit = limit.min(limits::MAX_TOP_TALKERS_LIMIT);
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
             let sql = format!(
-                "SELECT m.user_id, COALESCE(u.nickname, m.sender_nickname, '') as nickname, COUNT(*) as count \
+                "SELECT m.user_id, \
+                        COALESCE(u.nickname, m.sender_nickname, '') as nickname, \
+                        COUNT(*) as cnt \
                  FROM messages m \
                  LEFT JOIN users u ON m.user_id = u.user_id \
                  WHERE m.group_id = {} AND m.created_at >= {} \
-                 GROUP BY m.user_id ORDER BY count DESC LIMIT {}",
+                 GROUP BY m.user_id \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
                 group_id, start_time, limit
             );
 
@@ -1511,7 +1528,7 @@ pub mod db {
                     result.push(UserActivity {
                         user_id: row.try_get("", "user_id")?,
                         nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
-                        message_count: row.try_get("", "count")?,
+                        message_count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1531,11 +1548,15 @@ pub mod db {
             let (start_ts, end_ts) = Self::date_range_to_timestamps(start_date, end_date);
 
             let sql = format!(
-                "SELECT m.user_id, COALESCE(u.nickname, m.sender_nickname, '') as nickname, COUNT(*) as count \
+                "SELECT m.user_id, \
+                        COALESCE(u.nickname, m.sender_nickname, '') as nickname, \
+                        COUNT(*) as cnt \
                  FROM messages m \
                  LEFT JOIN users u ON m.user_id = u.user_id \
-                 WHERE m.group_id = {} AND m.created_at >= {} AND m.created_at <= {} \
-                 GROUP BY m.user_id ORDER BY count DESC LIMIT {}",
+                 WHERE m.group_id = {} AND m.created_at BETWEEN {} AND {} \
+                 GROUP BY m.user_id \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
                 group_id, start_ts, end_ts, limit
             );
 
@@ -1550,7 +1571,7 @@ pub mod db {
                     result.push(UserActivity {
                         user_id: row.try_get("", "user_id")?,
                         nickname: row.try_get::<String>("", "nickname").unwrap_or_default(),
-                        message_count: row.try_get("", "count")?,
+                        message_count: row.try_get("", "cnt")?,
                     });
                 }
                 Ok(result)
@@ -1564,16 +1585,16 @@ pub mod db {
             group_id: i64,
             days: i64,
         ) -> anyhow::Result<MessageTypeStats> {
-            let days = days.min(limits::MAX_QUERY_DAYS);
-            let start_time = kovi::chrono::Local::now().timestamp() - (days * 86400);
+            let start_time = kovi::chrono::Local::now().timestamp() - Self::safe_time_offset(days);
 
+            // 使用单个查询获取所有统计，利用覆盖索引
             let sql = format!(
                 "SELECT \
                     COUNT(*) as total, \
-                    SUM(CASE WHEN has_image = 0 AND has_at = 0 AND is_reply = 0 THEN 1 ELSE 0 END) as text_only, \
-                    SUM(CASE WHEN has_image = 1 THEN 1 ELSE 0 END) as with_image, \
-                    SUM(CASE WHEN has_at = 1 THEN 1 ELSE 0 END) as with_at, \
-                    SUM(CASE WHEN is_reply = 1 THEN 1 ELSE 0 END) as with_reply \
+                    SUM(CASE WHEN NOT has_image AND NOT has_at AND NOT is_reply THEN 1 ELSE 0 END) as text_only, \
+                    SUM(CASE WHEN has_image THEN 1 ELSE 0 END) as with_image, \
+                    SUM(CASE WHEN has_at THEN 1 ELSE 0 END) as with_at, \
+                    SUM(CASE WHEN is_reply THEN 1 ELSE 0 END) as with_reply \
                  FROM messages \
                  WHERE group_id = {} AND created_at >= {}",
                 group_id, start_time
@@ -1597,7 +1618,7 @@ pub mod db {
             .await
         }
 
-        /// 获取用户个人统计（带超时保护）
+        /// 获取用户个人统计
         pub async fn user_stats(
             &self,
             user_id: i64,
@@ -1607,32 +1628,26 @@ pub mod db {
                 .await
         }
 
-        /// 用户统计内部实现
         async fn user_stats_inner(
             &self,
             user_id: i64,
             group_id: Option<i64>,
         ) -> anyhow::Result<UserPersonalStats> {
             let group_filter = match group_id {
-                Some(gid) => format!("AND m.group_id = {}", gid),
-                None => String::new(),
-            };
-
-            let kw_group_filter = match group_id {
                 Some(gid) => format!("AND group_id = {}", gid),
                 None => String::new(),
             };
 
-            // 合并多个查询为一个，减少数据库往返
+            // 合并基础统计查询
             let sql = format!(
                 "SELECT \
                     COUNT(*) as total_messages, \
-                    COALESCE(AVG(text_length), 0) as avg_length, \
-                    MIN(m.created_at) as first_seen, \
-                    MAX(m.created_at) as last_seen, \
-                    COUNT(DISTINCT date(m.created_at, 'unixepoch', 'localtime')) as active_days \
-                 FROM messages m \
-                 WHERE m.user_id = {} {}",
+                    COALESCE(AVG(text_length), 0.0) as avg_length, \
+                    MIN(created_at) as first_seen, \
+                    MAX(created_at) as last_seen, \
+                    COUNT(DISTINCT date(created_at, 'unixepoch', 'localtime')) as active_days \
+                 FROM messages \
+                 WHERE user_id = {} {}",
                 user_id, group_filter
             );
 
@@ -1656,22 +1671,29 @@ pub mod db {
                 .unwrap_or_default();
 
             // 获取词汇总数
+            let kw_group_filter = match group_id {
+                Some(gid) => format!("AND group_id = {}", gid),
+                None => String::new(),
+            };
             let kw_sql = format!(
-                "SELECT COUNT(*) as count FROM keywords WHERE user_id = {} {}",
+                "SELECT COUNT(*) as cnt FROM keywords WHERE user_id = {} {}",
                 user_id, kw_group_filter
             );
             let total_words: i64 = self
                 .db
                 .query_one(Statement::from_string(DbBackend::Sqlite, kw_sql))
                 .await?
-                .and_then(|r| r.try_get("", "count").ok())
+                .and_then(|r| r.try_get("", "cnt").ok())
                 .unwrap_or(0);
 
             // 获取最活跃时段
             let hour_sql = format!(
-                "SELECT hour_of_day, COUNT(*) as count FROM messages \
+                "SELECT hour_of_day, COUNT(*) as cnt \
+                 FROM messages \
                  WHERE user_id = {} {} \
-                 GROUP BY hour_of_day ORDER BY count DESC LIMIT 1",
+                 GROUP BY hour_of_day \
+                 ORDER BY cnt DESC \
+                 LIMIT 1",
                 user_id, group_filter
             );
             let favorite_hour: Option<i32> = self
@@ -1680,9 +1702,9 @@ pub mod db {
                 .await?
                 .and_then(|r| r.try_get("", "hour_of_day").ok());
 
-            // 排名计算
+            // 计算排名（修复：移除子查询中的 LIMIT）
             let rank_in_group = if let Some(gid) = group_id {
-                self.calculate_user_rank(gid, user_id, total_messages).await
+                self.calculate_user_rank(gid, total_messages).await
             } else {
                 None
             };
@@ -1701,44 +1723,34 @@ pub mod db {
             })
         }
 
-        /// 用户排名计算
-        async fn calculate_user_rank(
-            &self,
-            group_id: i64,
-            user_id: i64,
-            user_msg_count: i64,
-        ) -> Option<i64> {
-            let _ = user_id;
+        /// 用户排名计算（修复版）
+        async fn calculate_user_rank(&self, group_id: i64, user_msg_count: i64) -> Option<i64> {
             if user_msg_count == 0 {
                 return None;
             }
 
-            // 只统计比该用户消息多的用户数量，添加 LIMIT 防止全表扫描
+            // 直接统计消息数大于当前用户的用户数量
+            // 不使用 LIMIT，确保排名准确
             let rank_sql = format!(
-                "SELECT COUNT(*) as rank FROM ( \
-                    SELECT user_id FROM messages \
-                    WHERE group_id = {} \
-                    GROUP BY user_id \
-                    HAVING COUNT(*) > {} \
-                    LIMIT {} \
-                )",
-                group_id,
-                user_msg_count,
-                limits::MAX_RANK_SCAN_USERS
+                "SELECT COUNT(DISTINCT user_id) as rank \
+                 FROM messages \
+                 WHERE group_id = {} \
+                 GROUP BY user_id \
+                 HAVING COUNT(*) > {}",
+                group_id, user_msg_count
             );
 
-            let rank: i64 = self
+            // 由于 HAVING 返回多行，我们需要计算行数
+            let rows = self
                 .db
-                .query_one(Statement::from_string(DbBackend::Sqlite, rank_sql))
+                .query_all(Statement::from_string(DbBackend::Sqlite, rank_sql))
                 .await
-                .ok()?
-                .and_then(|r| r.try_get("", "rank").ok())
-                .unwrap_or(0);
+                .ok()?;
 
-            Some(rank + 1)
+            Some(rows.len() as i64 + 1)
         }
 
-        /// 获取时段对比数据
+        /// 获取时段对比数据（优化版：使用 CASE WHEN 合并查询）
         pub async fn period_comparison(
             &self,
             group_id: i64,
@@ -1752,11 +1764,19 @@ pub mod db {
             let (prev_start_ts, prev_end_ts) =
                 Self::date_range_to_timestamps(previous_start, previous_end);
 
+            // 使用 CASE WHEN 合并为单个查询，减少数据库往返
             let sql = format!(
                 "SELECT \
-                    (SELECT COUNT(*) FROM messages WHERE group_id = {} AND created_at >= {} AND created_at <= {}) as current_count, \
-                    (SELECT COUNT(*) FROM messages WHERE group_id = {} AND created_at >= {} AND created_at <= {}) as previous_count",
-                group_id, cur_start_ts, cur_end_ts, group_id, prev_start_ts, prev_end_ts
+                    SUM(CASE WHEN created_at BETWEEN {} AND {} THEN 1 ELSE 0 END) as current_count, \
+                    SUM(CASE WHEN created_at BETWEEN {} AND {} THEN 1 ELSE 0 END) as previous_count \
+                 FROM messages \
+                 WHERE group_id = {} AND created_at >= {}",
+                cur_start_ts,
+                cur_end_ts,
+                prev_start_ts,
+                prev_end_ts,
+                group_id,
+                prev_start_ts.min(cur_start_ts)
             );
 
             let db = self.db.clone();
@@ -1789,9 +1809,12 @@ pub mod db {
         /// 获取用户在各群的活跃度
         pub async fn user_group_activity(&self, user_id: i64) -> anyhow::Result<Vec<(i64, i64)>> {
             let sql = format!(
-                "SELECT group_id, COUNT(*) as count FROM messages \
+                "SELECT group_id, COUNT(*) as cnt \
+                 FROM messages \
                  WHERE user_id = {} AND group_id IS NOT NULL \
-                 GROUP BY group_id ORDER BY count DESC LIMIT {}",
+                 GROUP BY group_id \
+                 ORDER BY cnt DESC \
+                 LIMIT {}",
                 user_id,
                 limits::MAX_TOP_TALKERS_LIMIT
             );
@@ -1805,7 +1828,7 @@ pub mod db {
                 let mut result = Vec::with_capacity(rows.len());
                 for row in rows {
                     let gid: i64 = row.try_get("", "group_id")?;
-                    let count: i64 = row.try_get("", "count")?;
+                    let count: i64 = row.try_get("", "cnt")?;
                     result.push((gid, count));
                 }
                 Ok(result)
@@ -1815,7 +1838,6 @@ pub mod db {
 
         /// 获取存储统计概况（带缓存）
         pub async fn storage_stats(&self) -> StorageStats {
-            // 先检查缓存
             {
                 let cache = self.storage_stats_cache.lock();
                 if let Some(cached) = cache.get() {
@@ -1823,10 +1845,8 @@ pub mod db {
                 }
             }
 
-            // 执行实际查询
             let stats = self.storage_stats_uncached().await;
 
-            // 更新缓存
             {
                 let mut cache = self.storage_stats_cache.lock();
                 cache.set(stats.clone());
@@ -1835,28 +1855,34 @@ pub mod db {
             stats
         }
 
-        /// 不带缓存的存储统计查询
         async fn storage_stats_uncached(&self) -> StorageStats {
-            let msg_count = Messages::find().count(&self.db).await.unwrap_or(0);
-            let kw_count = Keywords::find().count(&self.db).await.unwrap_or(0);
-            let user_count = Users::find().count(&self.db).await.unwrap_or(0);
+            // 合并统计查询，减少数据库往返
+            let sql = "SELECT \
+                (SELECT COUNT(*) FROM messages) as msg_count, \
+                (SELECT COUNT(*) FROM keywords) as kw_count, \
+                (SELECT COUNT(*) FROM users) as user_count, \
+                (SELECT COUNT(DISTINCT group_id) FROM messages WHERE group_id IS NOT NULL) as group_count";
 
-            let groups: u64 = {
-                let sql = "SELECT COUNT(DISTINCT group_id) as count FROM messages WHERE group_id IS NOT NULL";
-                self.db
-                    .query_one(Statement::from_string(DbBackend::Sqlite, sql))
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.try_get::<i64>("", "count").ok())
-                    .unwrap_or(0) as u64
-            };
+            let result = self
+                .db
+                .query_one(Statement::from_string(DbBackend::Sqlite, sql))
+                .await
+                .ok()
+                .flatten();
 
-            StorageStats {
-                total_messages: msg_count,
-                total_keywords: kw_count,
-                total_users: user_count,
-                groups_tracked: groups,
+            match result {
+                Some(row) => StorageStats {
+                    total_messages: row.try_get::<i64>("", "msg_count").unwrap_or(0) as u64,
+                    total_keywords: row.try_get::<i64>("", "kw_count").unwrap_or(0) as u64,
+                    total_users: row.try_get::<i64>("", "user_count").unwrap_or(0) as u64,
+                    groups_tracked: row.try_get::<i64>("", "group_count").unwrap_or(0) as u64,
+                },
+                None => StorageStats {
+                    total_messages: 0,
+                    total_keywords: 0,
+                    total_users: 0,
+                    groups_tracked: 0,
+                },
             }
         }
 
@@ -1951,13 +1977,11 @@ async fn main() {
         let bot = bot_clone.clone();
 
         async move {
-            // 一次性获取快照，立即释放锁
             let snapshot = {
                 let cfg = config_lock.read();
                 cfg.snapshot()
-            }; // 锁在这里立即释放
+            };
 
-            // 判断是否需要记录（使用快照，无锁）
             let should_record = match event.group_id {
                 Some(gid) => snapshot.should_record_group(gid),
                 None => snapshot.should_record_private(),
@@ -1973,7 +1997,6 @@ async fn main() {
                 });
             }
 
-            // 处理管理命令
             let text = match event.borrow_text() {
                 Some(t) => t.trim(),
                 None => return,
@@ -1989,12 +2012,10 @@ async fn main() {
 
             match text {
                 "开启记录" => {
-                    // 使用快照检查权限（无锁）
                     if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
                         event.reply("⚠️ 仅管理员可操作");
                         return;
                     }
-                    // 只有需要修改时才获取写锁
                     let msg = {
                         let mut cfg = config_lock.write();
                         cfg.enable_group(group_id)
