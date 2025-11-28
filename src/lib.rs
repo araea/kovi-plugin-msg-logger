@@ -223,12 +223,43 @@ admins = []
 enabled = true
 # 最小词长度（字符数）
 min_word_length = 2
-# 停用词列表
+# 停用词列表 (已大幅扩充过滤语气词、虚词、常用动词)
 stop_words = [
-    "的", "了", "在", "是", "我", "你", "他", "她", "它",
-    "有", "和", "与", "这", "那", "就", "也", "都", "而",
-    "及", "着", "或", "一个", "没有", "不是", "什么", "怎么",
-    "[图片]", "[表情]", "[语音]", "[视频]"
+    # --- 代词 & 称谓 ---
+    "我", "你", "他", "她", "它", "我们", "你们", "他们", "咱们", "大家",
+    "自己", "别人", "人家", "这里", "那里", "哪里",
+
+    # --- 常见语气词/填充词 (本次重点过滤) ---
+    "这个", "那个", "这种", "那种", "这样", "那样",
+    "有点", "有简", "有些", "有的", "其实", "确实",
+    "就是", "算是", "感觉", "觉得", "认为", "以为",
+    "可能", "大概", "应该", "好像", "似乎", "也许",
+    "然后", "接着", "结果", "后来", "之前", "之后",
+    "反正", "总之", "毕竟", "原来", "根本", "简直",
+    "真是", "真的", "非常", "特别", "相当", "比较",
+    "一般", "一直", "一定", "已经", "依然", "仍然",
+    "只是", "不过", "但是", "可是", "而且", "虽然",
+    "因为", "所以", "如果", "假如", "比如", "例如",
+    "顺便", "马上", "现在", "刚才", "最近", "平时",
+    "意思", "样子", "东西", "事情", "情况", "问题",
+    "一下", "一点", "一些", "一次", "一会儿",
+    "哈哈", "哈哈哈", "呵呵", "嘿嘿", "呜呜", "啧啧",
+
+    # --- 单字虚词/介词/助词 ---
+    "的", "了", "在", "是", "有", "和", "与", "或", "及",
+    "去", "来", "做", "干", "弄", "搞", "说", "看", "想",
+    "这", "那", "就", "也", "都", "而", "着", "吧", "呢",
+    "啊", "嘛", "呀", "哦", "噢", "嗯", "呗", "啦", "咯",
+    "被", "给", "把", "让", "对", "向", "往", "自", "从",
+    "不", "没", "别", "非", "无",
+
+    # --- 否定与判断组合 ---
+    "没有", "不是", "不行", "不能", "不会", "不要", "不用",
+    "可以", "能够", "需要", "愿意", "喜欢", "知道", "明白",
+    "出来", "进去", "起来", "下去", "回来", "回去",
+
+    # --- 特殊标记 ---
+    "[图片]", "[表情]", "[语音]", "[视频]", "[引用]", "truncated"
 ]
 
 [groups]
@@ -347,7 +378,12 @@ blacklist = []
         }
 
         fn rebuild_stop_words_set(&mut self) {
-            self.stop_words_set = self.tokenizer.stop_words.iter().cloned().collect();
+            self.stop_words_set = self
+                .tokenizer
+                .stop_words
+                .iter()
+                .map(|s| s.trim().to_string())
+                .collect();
         }
 
         pub fn save(&self) {
@@ -887,6 +923,7 @@ pub mod db {
                 let group_id = event.group_id;
                 let user_id = event.user_id;
                 let min_len = snapshot.min_word_length;
+                let stop_words = snapshot.stop_words.clone();
 
                 let keywords_data = tokio::task::spawn_blocking(move || {
                     let words = jieba.cut(&msg_text, true);
@@ -897,8 +934,25 @@ pub mod db {
                     for w in words {
                         let s = w.trim();
                         let len = s.chars().count();
-                        if len >= min_len && len <= max_word_len && !snapshot.is_stop_word(s) {
-                            word_set.entry(s.to_string()).or_insert(len as i32);
+
+                        // 增强过滤逻辑：
+                        // 1. 长度符合要求
+                        // 2. 不是停用词
+                        // 3. 不是纯数字 (避免 "2024", "123" 进入词云)
+                        // 4. 不是纯标点符号/特殊符号 (避免 "??", "...", "——" 进入词云)
+                        if len >= min_len && len <= max_word_len && !stop_words.contains(s)
+                        // 这里改用传入的HashSet直接判断
+                        {
+                            // 检查是否包含至少一个非数字且非标点的字符（即保留中文、英文单词）
+                            let is_meaningful = s.chars().any(|c| {
+                                !c.is_numeric() && !c.is_ascii_punctuation() && !c.is_control()
+                            });
+                            // 简单的排除纯全角符号（如 "。。。"）
+                            let is_pure_symbol = s.chars().all(|c| !c.is_alphanumeric());
+
+                            if is_meaningful && !is_pure_symbol {
+                                word_set.entry(s.to_string()).or_insert(len as i32);
+                            }
                         }
                     }
 
