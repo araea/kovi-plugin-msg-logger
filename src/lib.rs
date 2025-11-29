@@ -8,20 +8,6 @@
 //! - 用户信息表，自动追踪昵称/群名片变化
 //! - 丰富的可视化数据查询 API
 //! - 按群组配置记录策略（白名单/黑名单模式）
-//!
-//! ## 对外 API
-//! ```ignore
-//! if let Some(logger) = kovi_plugin_msg_logger::get_logger().await {
-//!     // 词云数据
-//!     let words = logger.query().word_cloud(group_id, 20, 7).await?;
-//!     // 二维热力图 (星期×小时)
-//!     let heatmap = logger.query().weekly_hourly_heatmap(group_id, 30).await?;
-//!     // 用户个人统计
-//!     let stats = logger.query().user_stats(user_id, Some(group_id)).await?;
-//!     // 消息类型分布
-//!     let types = logger.query().message_type_stats(group_id, 7).await?;
-//! }
-//! ```
 
 // =============================
 //          Modules
@@ -851,8 +837,63 @@ pub mod db {
             &self.query_api
         }
 
-        pub async fn log_message(&self, event: &Arc<MsgEvent>) -> anyhow::Result<()> {
-            let created_at = event.time;
+        // 在 impl Logger 内部添加这个私有辅助方法
+        async fn persist_pending_write(&self, write: PendingWrite) -> anyhow::Result<()> {
+            // 1. 插入/更新用户
+            users::Entity::insert(write.user_upsert)
+                .on_conflict(
+                    OnConflict::column(users::Column::UserId)
+                        .update_column(users::Column::Nickname)
+                        .update_column(users::Column::LastSeen)
+                        .value(
+                            users::Column::MessageCount,
+                            Expr::col(users::Column::MessageCount).add(1),
+                        )
+                        .to_owned(),
+                )
+                .exec(&self.db)
+                .await?;
+
+            // 2. 插入消息
+            let inserted = write.message.insert(&self.db).await?;
+
+            // 3. 插入关键词 (关联 Message ID)
+            if !write.keywords.is_empty() {
+                let keywords: Vec<keywords::ActiveModel> = write
+                    .keywords
+                    .into_iter()
+                    .map(|mut k| {
+                        k.message_id = ActiveValue::Set(inserted.id);
+                        k
+                    })
+                    .collect();
+
+                // 批量插入关键词
+                if !keywords.is_empty() {
+                    keywords::Entity::insert_many(keywords)
+                        .exec(&self.db)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+
+        // 抽取通用的记录逻辑到私有方法，避免代码重复
+        #[allow(clippy::too_many_arguments)]
+        async fn internal_log(
+            &self,
+            message_id: i64,
+            user_id: i64,
+            group_id: Option<i64>,
+            msg_type: String,
+            sub_type: Option<String>,
+            msg_text: String,
+            raw_json: String,
+            sender_nickname: String,
+            sender_card: Option<String>,
+            sender_role: Option<String>,
+            created_at: i64,
+        ) -> anyhow::Result<()> {
             let datetime = kovi::chrono::Local
                 .timestamp_opt(created_at, 0)
                 .single()
@@ -860,94 +901,78 @@ pub mod db {
             let hour_of_day = datetime.hour() as i32;
             let day_of_week = datetime.weekday().num_days_from_sunday() as i32;
 
-            let mut msg_text = event.borrow_text().unwrap_or("").to_string();
-            let mut raw_json = event.original_json.to_string();
-
+            // 处理文本截断
+            let mut safe_msg_text = msg_text.clone();
+            let mut safe_raw_json = raw_json.clone();
             const MAX_TEXT_LEN: usize = 4000;
             const MAX_JSON_LEN: usize = 10000;
 
-            if msg_text.len() > MAX_TEXT_LEN {
-                msg_text.truncate(MAX_TEXT_LEN);
-                msg_text.push_str("...(truncated)");
+            if safe_msg_text.len() > MAX_TEXT_LEN {
+                safe_msg_text.truncate(MAX_TEXT_LEN);
+                safe_msg_text.push_str("...(truncated)");
+            }
+            if safe_raw_json.len() > MAX_JSON_LEN {
+                safe_raw_json.truncate(MAX_JSON_LEN);
+                safe_raw_json.push_str("...(truncated)");
             }
 
-            if raw_json.len() > MAX_JSON_LEN {
-                raw_json.truncate(MAX_JSON_LEN);
-                raw_json.push_str("...(truncated)");
-            }
-
-            let has_image = raw_json.contains("\"type\":\"image\"");
-            let has_at = raw_json.contains("\"type\":\"at\"");
-            let is_reply = raw_json.contains("\"type\":\"reply\"");
+            let has_image = safe_raw_json.contains("\"type\":\"image\"");
+            let has_at = safe_raw_json.contains("\"type\":\"at\"");
+            let is_reply = safe_raw_json.contains("\"type\":\"reply\"");
 
             let msg_model = messages::ActiveModel {
-                message_id: ActiveValue::Set(event.message_id as i64),
-                user_id: ActiveValue::Set(event.user_id),
-                group_id: ActiveValue::Set(event.group_id),
-                msg_type: ActiveValue::Set(event.message_type.clone()),
-                sub_type: ActiveValue::Set(Some(event.sub_type.clone())),
-                raw_json: ActiveValue::Set(raw_json),
-                clean_text: ActiveValue::Set(msg_text.clone()),
-                text_length: ActiveValue::Set(msg_text.chars().count() as i32),
+                message_id: ActiveValue::Set(message_id),
+                user_id: ActiveValue::Set(user_id),
+                group_id: ActiveValue::Set(group_id),
+                msg_type: ActiveValue::Set(msg_type),
+                sub_type: ActiveValue::Set(sub_type),
+                raw_json: ActiveValue::Set(safe_raw_json),
+                clean_text: ActiveValue::Set(safe_msg_text.clone()),
+                text_length: ActiveValue::Set(safe_msg_text.chars().count() as i32),
                 has_image: ActiveValue::Set(has_image),
                 has_at: ActiveValue::Set(has_at),
                 is_reply: ActiveValue::Set(is_reply),
-                sender_nickname: ActiveValue::Set(
-                    event.sender.nickname.clone().unwrap_or_default(),
-                ),
-                sender_card: ActiveValue::Set(event.sender.card.clone()),
-                sender_role: ActiveValue::Set(event.sender.role.clone()),
+                sender_nickname: ActiveValue::Set(sender_nickname.clone()),
+                sender_card: ActiveValue::Set(sender_card),
+                sender_role: ActiveValue::Set(sender_role),
                 created_at: ActiveValue::Set(created_at),
                 hour_of_day: ActiveValue::Set(hour_of_day),
                 day_of_week: ActiveValue::Set(day_of_week),
                 ..Default::default()
             };
 
-            let nickname = event.sender.nickname.clone().unwrap_or_default();
             let user_model = users::ActiveModel {
-                user_id: ActiveValue::Set(event.user_id),
-                nickname: ActiveValue::Set(nickname),
+                user_id: ActiveValue::Set(user_id),
+                nickname: ActiveValue::Set(sender_nickname),
                 first_seen: ActiveValue::Set(created_at),
                 last_seen: ActiveValue::Set(created_at),
                 message_count: ActiveValue::Set(1),
             };
 
+            // 获取配置快照进行分词判断
             let snapshot = {
                 let cfg = config::get();
                 let cfg_read = cfg.read();
                 cfg_read.snapshot()
             };
 
-            let keywords = if snapshot.tokenizer_enabled && !msg_text.trim().is_empty() {
+            let keywords = if snapshot.tokenizer_enabled && !safe_msg_text.trim().is_empty() {
                 let jieba = self.jieba.clone();
-                let group_id = event.group_id;
-                let user_id = event.user_id;
                 let min_len = snapshot.min_word_length;
                 let stop_words = snapshot.stop_words.clone();
 
+                // 这里的逻辑与之前相同，直接复用分词任务
                 let keywords_data = tokio::task::spawn_blocking(move || {
-                    let words = jieba.cut(&msg_text, true);
+                    let words = jieba.cut(&safe_msg_text, true);
                     let max_word_len = 20;
-
                     let mut word_set: HashMap<String, i32> = HashMap::new();
-
                     for w in words {
                         let s = w.trim();
                         let len = s.chars().count();
-
-                        // 增强过滤逻辑：
-                        // 1. 长度符合要求
-                        // 2. 不是停用词
-                        // 3. 不是纯数字 (避免 "2024", "123" 进入词云)
-                        // 4. 不是纯标点符号/特殊符号 (避免 "??", "...", "——" 进入词云)
-                        if len >= min_len && len <= max_word_len && !stop_words.contains(s)
-                        // 这里改用传入的HashSet直接判断
-                        {
-                            // 检查是否包含至少一个非数字且非标点的字符（即保留中文、英文单词）
+                        if len >= min_len && len <= max_word_len && !stop_words.contains(s) {
                             let is_meaningful = s.chars().any(|c| {
                                 !c.is_numeric() && !c.is_ascii_punctuation() && !c.is_control()
                             });
-                            // 简单的排除纯全角符号（如 "。。。"）
                             let is_pure_symbol = s.chars().all(|c| !c.is_alphanumeric());
 
                             if is_meaningful && !is_pure_symbol {
@@ -955,18 +980,19 @@ pub mod db {
                             }
                         }
                     }
-
                     word_set.into_iter().collect::<Vec<_>>()
                 })
                 .await?;
 
+                // 构造 Keywords Model
+                let final_group_id = group_id;
                 keywords_data
                     .into_iter()
                     .map(|(word, word_length)| keywords::ActiveModel {
-                        message_id: ActiveValue::Set(0),
+                        message_id: ActiveValue::Set(0), // 稍后由 WriteBuffer 填充
                         word: ActiveValue::Set(word),
                         word_length: ActiveValue::Set(word_length),
-                        group_id: ActiveValue::Set(group_id),
+                        group_id: ActiveValue::Set(final_group_id),
                         user_id: ActiveValue::Set(user_id),
                         created_at: ActiveValue::Set(created_at),
                         ..Default::default()
@@ -982,142 +1008,111 @@ pub mod db {
                 user_upsert: user_model,
             };
 
-            if let Err(e) = self.write_buffer.send(pending).await {
-                kovi::log::warn!("[msg-logger] 写入缓冲区满，直接写入: {}", e);
-                self.direct_write(event, created_at, hour_of_day, day_of_week)
-                    .await?;
+            // 错误处理逻辑：如果缓冲区满，提取数据并直接写入
+            if let Err(mpsc::error::SendError(pending_write)) =
+                self.write_buffer.send(pending).await
+            {
+                kovi::log::warn!("[msg-logger] 写入缓冲区满，转为直接写入数据库");
+                self.persist_pending_write(pending_write).await?;
             }
 
             Ok(())
         }
 
-        async fn direct_write(
+        // 修改原 log_message 使用 internal_log
+        pub async fn log_message(&self, event: &Arc<MsgEvent>) -> anyhow::Result<()> {
+            let msg_text = event.borrow_text().unwrap_or("").to_string();
+            let raw_json = event.original_json.to_string();
+
+            self.internal_log(
+                event.message_id as i64,
+                event.user_id,
+                event.group_id,
+                event.message_type.clone(),
+                Some(event.sub_type.clone()),
+                msg_text,
+                raw_json,
+                event.sender.nickname.clone().unwrap_or_default(),
+                event.sender.card.clone(),
+                event.sender.role.clone(),
+                event.time,
+            )
+            .await
+        }
+
+        // 记录 Kovi 自身发送的消息
+        pub async fn log_kovi_event(
             &self,
-            event: &Arc<MsgEvent>,
-            created_at: i64,
-            hour_of_day: i32,
-            day_of_week: i32,
+            event: &Arc<kovi::event::MsgSendFromKoviEvent>,
+            self_id: i64,
         ) -> anyhow::Result<()> {
-            let mut msg_text = event.borrow_text().unwrap_or("").to_string();
-            let mut raw_json = event.original_json.to_string();
+            use kovi::{Message, event::msg_send_from_kovi_event::MsgSendFromKoviType};
 
-            const MAX_TEXT_LEN: usize = 4000;
-            const MAX_JSON_LEN: usize = 10000;
-
-            if msg_text.len() > MAX_TEXT_LEN {
-                msg_text.truncate(MAX_TEXT_LEN);
-                msg_text.push_str("...(truncated)");
-            }
-
-            if raw_json.len() > MAX_JSON_LEN {
-                raw_json.truncate(MAX_JSON_LEN);
-                raw_json.push_str("...(truncated)");
-            }
-
-            let has_image = raw_json.contains("\"type\":\"image\"");
-            let has_at = raw_json.contains("\"type\":\"at\"");
-            let is_reply = raw_json.contains("\"type\":\"reply\"");
-
-            let msg_model = messages::ActiveModel {
-                message_id: ActiveValue::Set(event.message_id as i64),
-                user_id: ActiveValue::Set(event.user_id),
-                group_id: ActiveValue::Set(event.group_id),
-                msg_type: ActiveValue::Set(event.message_type.clone()),
-                sub_type: ActiveValue::Set(Some(event.sub_type.clone())),
-                raw_json: ActiveValue::Set(raw_json),
-                clean_text: ActiveValue::Set(msg_text.clone()),
-                text_length: ActiveValue::Set(msg_text.chars().count() as i32),
-                has_image: ActiveValue::Set(has_image),
-                has_at: ActiveValue::Set(has_at),
-                is_reply: ActiveValue::Set(is_reply),
-                sender_nickname: ActiveValue::Set(
-                    event.sender.nickname.clone().unwrap_or_default(),
-                ),
-                sender_card: ActiveValue::Set(event.sender.card.clone()),
-                sender_role: ActiveValue::Set(event.sender.role.clone()),
-                created_at: ActiveValue::Set(created_at),
-                hour_of_day: ActiveValue::Set(hour_of_day),
-                day_of_week: ActiveValue::Set(day_of_week),
-                ..Default::default()
+            // 只有成功发送的消息才有记录价值（能获取到 message_id）
+            let message_id = match &event.res {
+                Ok(ret) => ret.data["message_id"].as_i64().unwrap_or(0),
+                Err(_) => return Ok(()), // 发送失败不记录
             };
 
-            let nickname = event.sender.nickname.clone().unwrap_or_default();
-            let user_model = users::ActiveModel {
-                user_id: ActiveValue::Set(event.user_id),
-                nickname: ActiveValue::Set(nickname),
-                first_seen: ActiveValue::Set(created_at),
-                last_seen: ActiveValue::Set(created_at),
-                message_count: ActiveValue::Set(1),
-            };
+            let params = &event.send_api.params;
 
-            users::Entity::insert(user_model)
-                .on_conflict(
-                    OnConflict::column(users::Column::UserId)
-                        .update_column(users::Column::Nickname)
-                        .update_column(users::Column::LastSeen)
-                        .value(
-                            users::Column::MessageCount,
-                            Expr::col(users::Column::MessageCount).add(1),
-                        )
-                        .to_owned(),
-                )
-                .exec(&self.db)
-                .await?;
+            // 解析消息内容
+            let msg_content = params.get("message").unwrap_or(&serde_json::Value::Null);
+            let message = Message::from_value(msg_content.clone()).unwrap_or_default();
+            let msg_text = message.to_human_string();
+            let raw_json = msg_content.to_string();
 
-            let inserted = msg_model.insert(&self.db).await?;
-            let db_id = inserted.id;
-
-            let snapshot = {
-                let cfg = config::get();
-                let cfg_read = cfg.read();
-                cfg_read.snapshot()
-            };
-
-            if snapshot.tokenizer_enabled && !msg_text.trim().is_empty() {
-                let jieba = self.jieba.clone();
-                let group_id = event.group_id;
-                let user_id = event.user_id;
-                let min_len = snapshot.min_word_length;
-
-                let keywords_data = tokio::task::spawn_blocking(move || {
-                    let words = jieba.cut(&msg_text, true);
-                    let max_word_len = 20;
-
-                    let mut word_set: HashMap<String, i32> = HashMap::new();
-
-                    for w in words {
-                        let s = w.trim();
-                        let len = s.chars().count();
-                        if len >= min_len && len <= max_word_len && !snapshot.is_stop_word(s) {
-                            word_set.entry(s.to_string()).or_insert(len as i32);
-                        }
-                    }
-
-                    word_set.into_iter().collect::<Vec<_>>()
-                })
-                .await?;
-
-                if !keywords_data.is_empty() {
-                    let keywords: Vec<keywords::ActiveModel> = keywords_data
-                        .into_iter()
-                        .map(|(word, word_length)| keywords::ActiveModel {
-                            message_id: ActiveValue::Set(db_id),
-                            word: ActiveValue::Set(word),
-                            word_length: ActiveValue::Set(word_length),
-                            group_id: ActiveValue::Set(group_id),
-                            user_id: ActiveValue::Set(user_id),
-                            created_at: ActiveValue::Set(created_at),
-                            ..Default::default()
-                        })
-                        .collect();
-
-                    keywords::Entity::insert_many(keywords)
-                        .exec(&self.db)
-                        .await?;
+            // 解析目标
+            let (group_id, msg_type) = match event.event_type {
+                MsgSendFromKoviType::SendGroupMsg | MsgSendFromKoviType::SendGroupForwardMsg => {
+                    (params["group_id"].as_i64(), "group".to_string())
                 }
-            }
+                MsgSendFromKoviType::SendPrivateMsg
+                | MsgSendFromKoviType::SendPrivateForwardMsg => (None, "private".to_string()),
+                // 其他类型暂归为 private 或忽略
+                _ => (None, "unknown".to_string()),
+            };
 
-            Ok(())
+            self.internal_log(
+                message_id,
+                self_id, // 发送者是 Bot 自己
+                group_id,
+                msg_type,
+                Some("self_sent".to_string()),
+                msg_text,
+                raw_json,
+                "Bot".to_string(), // Bot 昵称暂定
+                None,
+                Some("owner".to_string()), // Bot 权限较高
+                kovi::chrono::Local::now().timestamp(),
+            )
+            .await
+        }
+
+        // 记录服务端回显的消息（多端同步）
+        pub async fn log_server_event(
+            &self,
+            event: &Arc<kovi::event::MsgSendFromServerEvent>,
+        ) -> anyhow::Result<()> {
+            // MsgSendFromServerEvent 结构通常与 MsgEvent 类似，或者是 MsgEvent 的子集
+            // 假设它包含了必要字段
+            let msg_text = event.borrow_text().unwrap_or("").to_string();
+            let raw_json = event.original_json.to_string();
+
+            self.internal_log(
+                event.message_id as i64,
+                event.user_id,
+                event.group_id,
+                event.message_type.clone(),
+                Some(event.sub_type.clone()),
+                msg_text,
+                raw_json,
+                event.sender.nickname.clone().unwrap_or_default(),
+                event.sender.card.clone(),
+                event.sender.role.clone(),
+                event.time,
+            )
+            .await
         }
     }
 
@@ -1248,6 +1243,35 @@ pub mod db {
                     limits::DEFAULT_QUERY_TIMEOUT_SECS
                 )
             })?
+        }
+
+        /// 获取群组最近的消息上下文（按时间正序排列）
+        /// 用于提供给 mimicry 等插件作为上下文
+        pub async fn get_recent_group_messages(
+            &self,
+            group_id: i64,
+            limit: u64,
+        ) -> anyhow::Result<Vec<messages::Model>> {
+            let limit = limit.min(50); // 限制最大上下文数量，防止 Token 溢出
+
+            let db = self.db.clone();
+
+            self.query_with_timeout(|| async {
+                // 1. 先按时间倒序查出最近的 N 条
+                let results = Messages::find()
+                    .filter(messages::Column::GroupId.eq(group_id))
+                    // 过滤掉过长的消息或非文本消息，保证上下文质量（可选）
+                    .filter(messages::Column::TextLength.lt(500))
+                    .order_by_desc(messages::Column::CreatedAt)
+                    .limit(limit)
+                    .all(&db)
+                    .await?;
+
+                // 2. 反转为正序（旧 -> 新）
+                let ordered_results = results.into_iter().rev().collect();
+                Ok(ordered_results)
+            })
+            .await
         }
 
         /// 获取词云数据（基于天数）
@@ -2190,7 +2214,10 @@ pub mod db {
 //      Main Plugin Logic
 // =============================
 
-use kovi::PluginBuilder;
+use kovi::{
+    PluginBuilder,
+    event::{MsgSendFromKoviEvent, MsgSendFromServerEvent},
+};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
@@ -2206,6 +2233,11 @@ async fn main() {
     let bot = PluginBuilder::get_runtime_bot();
     let bot_clone = bot.clone();
 
+    let self_id = match bot.get_login_info().await {
+        Ok(res) => res.data["user_id"].as_i64().unwrap_or(0),
+        Err(_) => 0,
+    };
+
     let data_dir = bot.get_data_path();
 
     let config_lock = config::Config::load(data_dir.clone());
@@ -2214,74 +2246,133 @@ async fn main() {
     let logger = Arc::new(db::Logger::new(data_dir).await);
     LOGGER.set(logger.clone()).ok();
 
-    kovi::log::info!("[msg-logger] 消息记录器已启动");
+    kovi::log::info!("[msg-logger] 消息记录器已启动 (Self ID: {})", self_id);
 
-    PluginBuilder::on_msg(move |event| {
+    PluginBuilder::on_msg({
         let logger = logger.clone();
         let config_lock = config_lock.clone();
         let bot = bot_clone.clone();
 
-        async move {
-            let snapshot = {
-                let cfg = config_lock.read();
-                cfg.snapshot()
-            };
+        move |event| {
+            let logger = logger.clone();
+            let config_lock = config_lock.clone();
+            let bot = bot.clone();
 
-            let should_record = match event.group_id {
-                Some(gid) => snapshot.should_record_group(gid),
-                None => snapshot.should_record_private(),
-            };
+            async move {
+                let snapshot = {
+                    let cfg = config_lock.read();
+                    cfg.snapshot()
+                };
 
-            if should_record {
-                let log_event = event.clone();
-                let log_logger = logger.clone();
-                kovi::tokio::spawn(async move {
-                    if let Err(e) = log_logger.log_message(&log_event).await {
-                        kovi::log::error!("[msg-logger] 记录失败: {}", e);
+                let should_record = match event.group_id {
+                    Some(gid) => snapshot.should_record_group(gid),
+                    None => snapshot.should_record_private(),
+                };
+
+                if should_record {
+                    let log_event = event.clone();
+                    let log_logger = logger.clone();
+                    kovi::tokio::spawn(async move {
+                        if let Err(e) = log_logger.log_message(&log_event).await {
+                            kovi::log::error!("[msg-logger] 记录失败: {}", e);
+                        }
+                    });
+                }
+
+                let text = match event.borrow_text() {
+                    Some(t) => t.trim(),
+                    None => return,
+                };
+
+                if !event.is_group() {
+                    return;
+                }
+
+                let group_id = event.group_id.unwrap();
+                let sender_role = event.sender.role.as_deref();
+                let bot_admins = bot.get_all_admin().unwrap_or_default();
+
+                match text {
+                    "开启记录" => {
+                        if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
+                            event.reply("⚠️ 仅管理员可操作");
+                            return;
+                        }
+                        let msg = {
+                            let mut cfg = config_lock.write();
+                            cfg.enable_group(group_id)
+                        };
+                        event.reply(msg);
                     }
-                });
+                    "关闭记录" => {
+                        if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
+                            event.reply("⚠️ 仅管理员可操作");
+                            return;
+                        }
+                        let msg = {
+                            let mut cfg = config_lock.write();
+                            cfg.disable_group(group_id)
+                        };
+                        event.reply(msg);
+                    }
+                    "记录状态" => {
+                        handle_status(group_id, &event, &logger, &snapshot).await;
+                    }
+                    _ => {}
+                }
             }
+        }
+    });
 
-            let text = match event.borrow_text() {
-                Some(t) => t.trim(),
-                None => return,
-            };
+    // 监听 Kovi 自身发送的消息
+    PluginBuilder::on({
+        let logger = logger.clone();
+        let config_lock = config_lock.clone();
 
-            if !event.is_group() {
-                return;
+        move |event: Arc<MsgSendFromKoviEvent>| {
+            let logger = logger.clone();
+            let config_lock = config_lock.clone();
+
+            async move {
+                // 从 params 中提取 group_id 以判断是否记录
+                let group_id = event
+                    .send_api
+                    .params
+                    .get("group_id")
+                    .and_then(|v| v.as_i64());
+
+                let snapshot = config_lock.read().snapshot();
+                let should_record = match group_id {
+                    Some(gid) => snapshot.should_record_group(gid),
+                    None => snapshot.should_record_private(),
+                };
+
+                if should_record && let Err(e) = logger.log_kovi_event(&event, self_id).await {
+                    kovi::log::error!("[msg-logger] 自身消息记录失败: {}", e);
+                }
             }
+        }
+    });
 
-            let group_id = event.group_id.unwrap();
-            let sender_role = event.sender.role.as_deref();
-            let bot_admins = bot.get_all_admin().unwrap_or_default();
+    // 监听服务端回显的消息
+    PluginBuilder::on({
+        let logger = logger.clone();
+        let config_lock = config_lock.clone();
 
-            match text {
-                "开启记录" => {
-                    if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
-                        event.reply("⚠️ 仅管理员可操作");
-                        return;
-                    }
-                    let msg = {
-                        let mut cfg = config_lock.write();
-                        cfg.enable_group(group_id)
-                    };
-                    event.reply(msg);
+        move |event: Arc<MsgSendFromServerEvent>| {
+            let logger = logger.clone();
+            let config_lock = config_lock.clone();
+
+            async move {
+                let snapshot = config_lock.read().snapshot();
+                let should_record = match event.group_id {
+                    Some(gid) => snapshot.should_record_group(gid),
+                    None => snapshot.should_record_private(),
+                };
+
+                if should_record && let Err(e) = logger.log_server_event(&event).await {
+                    kovi::log::error!("[msg-logger] 服务端回显记录失败: {}", e);
                 }
-                "关闭记录" => {
-                    if !snapshot.is_admin(event.user_id, sender_role, &bot_admins) {
-                        event.reply("⚠️ 仅管理员可操作");
-                        return;
-                    }
-                    let msg = {
-                        let mut cfg = config_lock.write();
-                        cfg.disable_group(group_id)
-                    };
-                    event.reply(msg);
-                }
-                "记录状态" => {
-                    handle_status(group_id, &event, &logger, &snapshot).await;
-                }
-                _ => {}
             }
         }
     });
