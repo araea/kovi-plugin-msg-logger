@@ -1280,7 +1280,7 @@ pub mod db {
 
         /// 获取指定时间范围内的所有消息
         /// 用于分析系统（如 mimicry）获取历史日志进行总结
-        pub async fn get_messages_range(
+        pub async fn get_messages_by_time_range(
             &self,
             start_ts: u64,
             end_ts: u64,
