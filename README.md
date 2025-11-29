@@ -151,7 +151,7 @@ if let Some(logger) = get_logger().await {
 
 **检索与上下文：**
 *   `get_recent_group_messages`: 获取群组最近消息上下文（正序，Limit限制）
-*   `get_messages_range`: 获取指定时间戳范围内的完整消息日志
+*   `get_messages_by_time_range`: 获取指定时间戳范围内的完整消息日志
 *   `search_messages`: 全文搜索消息
 *   `user_messages`: 获取指定用户的历史消息列表
 
