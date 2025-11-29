@@ -10,7 +10,7 @@ repository = "https://github.com/araea/kovi-plugin-msg-logger"
 keywords = ["kovi", "kovi-plugin", "sqlite", "jieba", "analysis"]
 
 [dependencies]
-kovi.workspace = true
+# kovi.workspace = true
 
 kovi = ">=0.12"
 log = "0.4"
