@@ -1274,6 +1274,39 @@ pub mod db {
             .await
         }
 
+        // =========================================================
+        //  为 Mimicry 插件提供的按时间范围查询接口
+        // =========================================================
+
+        /// 获取指定时间范围内的所有消息
+        /// 用于分析系统（如 mimicry）获取历史日志进行总结
+        pub async fn get_messages_range(
+            &self,
+            start_ts: u64,
+            end_ts: u64,
+        ) -> anyhow::Result<Vec<messages::Model>> {
+            let db = self.db.clone();
+            // 数据库存的是 i64，这里做转换
+            let start = start_ts as i64;
+            let end = end_ts as i64;
+
+            self.query_with_timeout(|| async {
+                // 为了防止查询数据量过大导致内存溢出，建议设置一个安全上限 (例如 5000 条)
+                // 如果需要全量分析，建议在业务层分片查询
+                const SAFETY_LIMIT: u64 = 5000;
+
+                let results = Messages::find()
+                    .filter(messages::Column::CreatedAt.gte(start))
+                    .filter(messages::Column::CreatedAt.lte(end))
+                    .order_by_asc(messages::Column::CreatedAt)
+                    .limit(SAFETY_LIMIT)
+                    .all(&db)
+                    .await?;
+                Ok(results)
+            })
+            .await
+        }
+
         /// 获取词云数据（基于天数）
         pub async fn word_cloud(
             &self,

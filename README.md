@@ -80,7 +80,7 @@ blacklist = []
 
 ## 开发者接口 (Rust)
 
-本插件设计为 Core Library，其他插件可以通过 API 获取清洗后的数据制作高级功能（如：生成今日词云图、年度报告等）。
+本插件设计为 Core Library，其他插件可以通过 API 获取清洗后的数据制作高级功能（如：生成今日词云图、年度报告、AI 上下文构建等）。
 
 在你的 `Cargo.toml` 中添加本插件作为依赖，然后在代码中调用：
 
@@ -114,6 +114,13 @@ if let Some(logger) = get_logger().await {
     // 6. 获取时段对比（例如：本周对比上周消息量变化）
     // 需要传入四个 NaiveDate
     // query.period_comparison(group_id, cur_start, cur_end, prev_start, prev_end).await?;
+
+    // 7. [新] 获取群组最近的上下文消息 (正序，适合构建 LLM 上下文)
+    let context_msgs = query.get_recent_group_messages(group_id, 20).await?;
+
+    // 8. [新] 获取指定时间范围的所有消息 (适合日志分析/导出)
+    // 传入 Unix 时间戳 (秒)
+    let history = query.get_messages_range(start_ts, end_ts).await?;
 }
 ```
 
@@ -142,7 +149,9 @@ if let Some(logger) = get_logger().await {
 *   `user_stats`: 获取单用户深度分析（包含排名、最爱时段、平均字数等）
 *   `user_group_activity`: 获取用户在所有群的活跃度分布
 
-**检索：**
+**检索与上下文：**
+*   `get_recent_group_messages`: 获取群组最近消息上下文（正序，Limit限制）
+*   `get_messages_range`: 获取指定时间戳范围内的完整消息日志
 *   `search_messages`: 全文搜索消息
 *   `user_messages`: 获取指定用户的历史消息列表
 
